@@ -1,0 +1,14 @@
+.codegraph/
+
+.idea/
+
+/build/*
+!/build/
+!/build/*.png
+!/build/*.ico
+!/build/*.icns
+# Ignore generated/local docs markdown
+docs/*.md
+docs/**/*.md
+
+.serena/

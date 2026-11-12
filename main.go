@@ -1,0 +1,10021 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
+	"io/ioutil"
+	"log"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	nativedialog "github.com/sqweek/dialog"
+	"golang.org/x/image/bmp"
+)
+
+// 颜色点信息结构
+type ColorPoint struct {
+	ID       int
+	Position string
+	Color    string
+	Offset   string
+	Selected bool
+}
+
+// 标签页数据结构 - 保存每个标签页的独立数据
+type TabData struct {
+	colorPoints        []ColorPoint // 该标签页的颜色点列表
+	markRects          []MarkRect   // 该标签页的矩形标记
+	manualRectSelected bool         // 是否手动框选了区域
+	imageViewer        *ImageViewer // 该标签页的图像查看器
+	generatedCode      string       // 该标签页生成的代码
+	nodeToolOnly       bool         // 是否为节点工具专用页
+}
+
+type UserConfig struct {
+	Precision            string `json:"precision"`
+	UniformOffset        string `json:"uniform_offset"`
+	PickCount            string `json:"pick_count"`
+	PickMode             string `json:"pick_mode"`
+	FunctionMode         string `json:"function_mode"`
+	DirectionMode        string `json:"direction_mode"`
+	ScreenshotSource     string `json:"screenshot_source"`
+	RemoteScreenshotPort int    `json:"remote_screenshot_port"`
+	AutoSaveScreenshot   bool   `json:"auto_save_screenshot"`
+	ScreenshotSavePath   string `json:"screenshot_save_path"`
+	LogEnabled           bool   `json:"log_enabled"`
+	ThemeMode            string `json:"theme_mode"`
+	ThemeScheme          string `json:"theme_scheme"`
+	ShowMagnifier        bool   `json:"show_magnifier"`
+	AutoCopyRange        bool   `json:"auto_copy_range"`
+	ApplyRange           bool   `json:"apply_range"`
+	GridMode             bool   `json:"grid_mode"`
+	GridCols             int    `json:"grid_cols"`
+	GridRows             int    `json:"grid_rows"`
+	GridSpacing          int    `json:"grid_spacing"`
+
+	RightPanelSplitOffset float64                   `json:"right_panel_split_offset"`
+	FontLibWindowWidth    float32                   `json:"font_lib_window_width"`
+	FontLibRightSplit     float64                   `json:"font_lib_right_split"`
+	FontLibPaths          []string                  `json:"font_lib_paths"`
+	CustomThemeSchemes    []CustomThemeSchemeConfig `json:"custom_theme_schemes"`
+	FormatTemplates       map[string]string         `json:"format_templates"`
+	ImageCodeTemplates    []ImageCodeTemplate       `json:"image_code_templates"`
+	Shortcuts             map[string]string         `json:"shortcuts"`
+	ToolButtons           []ToolButtonConfig        `json:"tool_buttons"`
+}
+
+type ToolButtonConfig struct {
+	CommandID string `json:"command_id"`
+	Label     string `json:"label,omitempty"`
+	Visible   bool   `json:"visible"`
+	Order     int    `json:"order"`
+}
+
+type CustomThemeSchemeConfig struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Primary          string `json:"primary"`
+	Background       string `json:"background"`
+	Button           string `json:"button"`
+	HeaderBackground string `json:"header_background"`
+}
+
+// 全局变量定义
+var (
+	transparent       = color.NRGBA{0, 0, 0, 0}       // 透明色
+	findTestMarkColor = color.NRGBA{255, 0, 255, 255} // 找色测试结果高亮色
+	nodeFindTestColor = color.NRGBA{0, 255, 120, 255} // 节点查找测试结果高亮色
+	linkedPointColor  = color.NRGBA{255, 215, 0, 255} // 图像点和列表联动高亮色
+	linkedRowBgColor  = color.NRGBA{255, 215, 0, 110} // 图像点和列表联动行背景色
+
+	// 主题状态变量 - 初始值会在程序启动时根据系统主题设置
+	isDarkTheme               = false
+	currentThemeSchemeID      = appThemeSchemeClassicBlue
+	currentCustomThemeSchemes []CustomThemeSchemeConfig
+
+	// 设备选择相关变量
+	deviceSelect         *widget.Select
+	displaySelect        *widget.Select
+	selectedDevice       string
+	selectedDisplayID    = "0"
+	deviceDisplayOptions = map[string][]string{}
+	deviceRefreshChan    = make(chan bool)
+
+	// 区域坐标显示
+	rectCoordEntry *widget.Entry
+
+	// 偏色值输入
+	colorOffsetEntry *widget.Entry
+
+	// 右侧表格新增点时使用的默认偏色
+	defaultColorPointOffset = "202020"
+
+	// 框选范围后是否自动复制
+	autoCopyRangeEnabled = true
+
+	// 找色模式选择
+	colorModeRadio *widget.RadioGroup
+
+	// 图像查看器（当前活动的）
+	imageViewer *ImageViewer
+
+	// 放大镜显示状态
+	magnifierEnabled = true
+
+	// 代码显示框
+	codeDisplayEntry *widget.Entry
+
+	// 图色面板 API 字段刷新回调
+	updateImagesAPIFields func() string
+
+	// 右侧工具页切换回调
+	selectColorToolTab func()
+	selectNodeToolTab  func()
+
+	// 图色面板结果代码格式模板
+	apiFormatTemplates = defaultAPIFormatTemplates()
+
+	// 点阵模式状态
+	gridModeEnabled  = false // 默认关闭点阵模式
+	gridColsValue    = 4
+	gridRowsValue    = 4
+	gridSpacingValue = 7
+	adb              = findADBPath()
+)
+
+const deviceSelectPrompt = "--设备选择--"
+const displaySelectPrompt = "--虚拟屏选择--"
+
+const (
+	appThemeModeSystem = "system"
+	appThemeModeLight  = "light"
+	appThemeModeDark   = "dark"
+)
+
+const (
+	appThemeSchemeClassicBlue = "classic_blue"
+	appThemeSchemeEmerald     = "emerald"
+	appThemeSchemeViolet      = "violet"
+	appThemeSchemeAmber       = "amber"
+	appThemeSchemeCyber       = "cyber"
+)
+
+const (
+	appThemeCustomSchemePrefix        = "custom:"
+	appThemeCustomSchemeDisplayPrefix = "自定义："
+)
+
+const (
+	aboutCurrentVersion = "1.0.0"
+	aboutLatestVersion  = "1.0.0"
+	aboutContactEmail   = "tp9527@qq.com"
+	aboutProjectURL     = "https://github.com/xiaozhang959/autoGO-Chromatic-Tool.git"
+	aboutReleaseNotes   = `暂无版本更新日志。
+
+后续发布版本时，可以在这里维护每个版本的更新内容。`
+)
+
+const (
+	shortcutActionScreenshot = "screenshot"
+	shortcutActionImport     = "import_image"
+	shortcutActionRange      = "range_select"
+	shortcutActionAutoPick   = "auto_pick"
+	shortcutActionClearAll   = "clear_all"
+	commandCopyCoords        = "copy_coords"
+	commandPasteCoords       = "paste_coords"
+	commandApplyOffset       = "apply_offset"
+	commandClearOffset       = "clear_offset"
+	commandCopyCode          = "copy_code"
+	commandFindTest          = "find_test"
+	commandCodeTest          = "code_test"
+	commandCopyColor         = "copy_color"
+	commandCopyParams        = "copy_params"
+	commandFormatSettings    = "format_settings"
+	commandResetRange        = "reset_range"
+	commandCopyRange         = "copy_range"
+	commandResetZoom         = "reset_zoom"
+	commandOriginalSize      = "original_size"
+	commandClearFindMarks    = "clear_find_marks"
+	commandToggleGrid        = "toggle_grid"
+	commandToggleTheme       = "toggle_theme"
+	commandGrabNode          = "grab_node"
+	commandNodeCaptureSimple = "node_capture_simple"
+	commandNodeSearch        = "node_search"
+	commandNodePrevious      = "node_previous"
+	commandNodeNext          = "node_next"
+	commandNodeSelectAll     = "node_select_all"
+	commandNodeClearSelected = "node_clear_selected"
+	commandNodeTestSelector  = "node_test_selector"
+	commandNodeGenerateCode  = "node_generate_code"
+	commandNodeCopyCode      = "node_copy_code"
+	commandNodeCopyParams    = "node_copy_params"
+	commandNodeFormat        = "node_format"
+	commandAppInfoQuery      = "app_info_query"
+	commandAppInfoCopyName   = "app_info_copy_name"
+	commandAppInfoCopyPkg    = "app_info_copy_package"
+	commandAppInfoCopyLaunch = "app_info_copy_launcher"
+	commandAppInfoCopyActs   = "app_info_copy_activities"
+	commandFontLibrary       = "font_library"
+)
+
+var defaultShortcutTexts = map[string]string{
+	shortcutActionScreenshot: "Ctrl+Z",
+	shortcutActionImport:     "Ctrl+L",
+	shortcutActionRange:      "Ctrl+R",
+	shortcutActionAutoPick:   "Ctrl+A",
+	shortcutActionClearAll:   "Ctrl+E",
+	commandCopyCoords:        "",
+	commandPasteCoords:       "",
+	commandApplyOffset:       "",
+	commandClearOffset:       "",
+	commandCopyCode:          "",
+	commandFindTest:          "",
+	commandCodeTest:          "",
+	commandCopyColor:         "",
+	commandCopyParams:        "",
+	commandFormatSettings:    "",
+	commandResetRange:        "",
+	commandCopyRange:         "",
+	commandResetZoom:         "",
+	commandOriginalSize:      "",
+	commandClearFindMarks:    "",
+	commandToggleGrid:        "",
+	commandToggleTheme:       "",
+	commandGrabNode:          "",
+	commandNodeCaptureSimple: "",
+	commandNodeSearch:        "",
+	commandNodePrevious:      "",
+	commandNodeNext:          "",
+	commandNodeSelectAll:     "",
+	commandNodeClearSelected: "",
+	commandNodeTestSelector:  "",
+	commandNodeGenerateCode:  "",
+	commandNodeCopyCode:      "",
+	commandNodeCopyParams:    "",
+	commandNodeFormat:        "",
+	commandAppInfoQuery:      "",
+	commandAppInfoCopyName:   "",
+	commandAppInfoCopyPkg:    "",
+	commandAppInfoCopyLaunch: "",
+	commandAppInfoCopyActs:   "",
+	commandFontLibrary:       "",
+}
+
+type commandDefinition struct {
+	ID             string
+	Label          string
+	Category       string
+	DefaultToolbar bool
+}
+
+var commandDefinitions = []commandDefinition{
+	{ID: shortcutActionScreenshot, Label: "截图", Category: "图像", DefaultToolbar: false},
+	{ID: shortcutActionImport, Label: "加载图片", Category: "图像", DefaultToolbar: false},
+	{ID: shortcutActionRange, Label: "范围框选", Category: "图像", DefaultToolbar: false},
+	{ID: shortcutActionAutoPick, Label: "自动取色", Category: "图像", DefaultToolbar: false},
+	{ID: shortcutActionClearAll, Label: "清除所有", Category: "取色点", DefaultToolbar: true},
+	{ID: commandCopyCoords, Label: "复制坐标", Category: "取色点", DefaultToolbar: true},
+	{ID: commandPasteCoords, Label: "粘贴坐标", Category: "取色点", DefaultToolbar: true},
+	{ID: commandApplyOffset, Label: "统一偏色", Category: "取色点", DefaultToolbar: true},
+	{ID: commandClearOffset, Label: "清除偏色", Category: "取色点", DefaultToolbar: true},
+	{ID: commandCopyCode, Label: "生成代码", Category: "代码", DefaultToolbar: false},
+	{ID: commandFindTest, Label: "找色测试", Category: "测试", DefaultToolbar: false},
+	{ID: commandCodeTest, Label: "代码测试", Category: "测试", DefaultToolbar: false},
+	{ID: commandCopyColor, Label: "复制颜色", Category: "代码", DefaultToolbar: false},
+	{ID: commandCopyParams, Label: "复制参数", Category: "代码", DefaultToolbar: false},
+	{ID: commandFormatSettings, Label: "格式配置", Category: "代码", DefaultToolbar: false},
+	{ID: commandCopyRange, Label: "复制范围", Category: "范围", DefaultToolbar: false},
+	{ID: commandResetRange, Label: "重置范围", Category: "范围", DefaultToolbar: false},
+	{ID: commandResetZoom, Label: "重置缩放", Category: "图像", DefaultToolbar: false},
+	{ID: commandOriginalSize, Label: "显示原始尺寸", Category: "图像", DefaultToolbar: false},
+	{ID: commandClearFindMarks, Label: "清除查找标记", Category: "图像", DefaultToolbar: false},
+	{ID: commandToggleGrid, Label: "点阵模式", Category: "系统", DefaultToolbar: false},
+	{ID: commandToggleTheme, Label: "切换主题", Category: "系统", DefaultToolbar: false},
+	{ID: commandGrabNode, Label: "抓取节点", Category: "节点", DefaultToolbar: false},
+	{ID: commandNodeCaptureSimple, Label: "简单节点抓取", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeSearch, Label: "搜索", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodePrevious, Label: "上一个", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeNext, Label: "下一个", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeSelectAll, Label: "全部勾选", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeClearSelected, Label: "清除全选", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeTestSelector, Label: "查找测试", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeGenerateCode, Label: "生成代码", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeCopyCode, Label: "复制代码", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeCopyParams, Label: "复制参数", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandNodeFormat, Label: "格式配置", Category: "节点工具", DefaultToolbar: false},
+	{ID: commandAppInfoQuery, Label: "查询应用", Category: "App信息", DefaultToolbar: false},
+	{ID: commandAppInfoCopyName, Label: "复制应用名称", Category: "App信息", DefaultToolbar: false},
+	{ID: commandAppInfoCopyPkg, Label: "复制应用包名", Category: "App信息", DefaultToolbar: false},
+	{ID: commandAppInfoCopyLaunch, Label: "复制界面名称", Category: "App信息", DefaultToolbar: false},
+	{ID: commandAppInfoCopyActs, Label: "复制其它界面", Category: "App信息", DefaultToolbar: false},
+	{ID: commandFontLibrary, Label: "字库制作", Category: "工具", DefaultToolbar: false},
+}
+
+var pickModeOptions = []string{
+	"随机取点",
+	"轮廓取点",
+	"高亮取点",
+	"高饱和取点",
+	"颜色分类轮廓",
+	"颜色分类随机",
+}
+
+var appThemeModeOptions = []string{
+	"跟随系统",
+	"浅色",
+	"深色",
+}
+
+type appThemePalette struct {
+	Primary          color.NRGBA
+	Foreground       color.NRGBA
+	ForegroundOnKey  color.NRGBA
+	Background       color.NRGBA
+	Button           color.NRGBA
+	InputBackground  color.NRGBA
+	InputBorder      color.NRGBA
+	HeaderBackground color.NRGBA
+	Selection        color.NRGBA
+	Hover            color.NRGBA
+	Focus            color.NRGBA
+	Separator        color.NRGBA
+	Placeholder      color.NRGBA
+	Shadow           color.NRGBA
+}
+
+type appThemeScheme struct {
+	ID    string
+	Name  string
+	Light appThemePalette
+	Dark  appThemePalette
+}
+
+var appThemeSchemes = []appThemeScheme{
+	{
+		ID:   appThemeSchemeClassicBlue,
+		Name: "经典蓝",
+		Light: appThemePalette{
+			Primary:          color.NRGBA{29, 78, 216, 255},
+			Foreground:       color.NRGBA{17, 24, 39, 255},
+			ForegroundOnKey:  color.NRGBA{255, 255, 255, 255},
+			Background:       color.NRGBA{241, 245, 249, 255},
+			Button:           color.NRGBA{226, 232, 240, 255},
+			InputBackground:  color.NRGBA{229, 231, 235, 255},
+			InputBorder:      color.NRGBA{148, 163, 184, 255},
+			HeaderBackground: color.NRGBA{215, 226, 242, 255},
+			Selection:        color.NRGBA{191, 219, 254, 255},
+			Hover:            color.NRGBA{219, 234, 254, 255},
+			Focus:            color.NRGBA{37, 99, 235, 88},
+			Separator:        color.NRGBA{203, 213, 225, 255},
+			Placeholder:      color.NRGBA{100, 116, 139, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 45},
+		},
+		Dark: appThemePalette{
+			Primary:          color.NRGBA{96, 165, 250, 255},
+			Foreground:       color.NRGBA{248, 250, 252, 255},
+			ForegroundOnKey:  color.NRGBA{15, 23, 42, 255},
+			Background:       color.NRGBA{15, 23, 42, 255},
+			Button:           color.NRGBA{30, 41, 59, 255},
+			InputBackground:  color.NRGBA{38, 50, 68, 255},
+			InputBorder:      color.NRGBA{71, 85, 105, 255},
+			HeaderBackground: color.NRGBA{17, 24, 39, 255},
+			Selection:        color.NRGBA{30, 64, 175, 255},
+			Hover:            color.NRGBA{30, 58, 138, 255},
+			Focus:            color.NRGBA{96, 165, 250, 92},
+			Separator:        color.NRGBA{51, 65, 85, 255},
+			Placeholder:      color.NRGBA{148, 163, 184, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 120},
+		},
+	},
+	{
+		ID:   appThemeSchemeEmerald,
+		Name: "翡翠绿",
+		Light: appThemePalette{
+			Primary:          color.NRGBA{4, 120, 87, 255},
+			Foreground:       color.NRGBA{17, 24, 39, 255},
+			ForegroundOnKey:  color.NRGBA{255, 255, 255, 255},
+			Background:       color.NRGBA{240, 253, 244, 255},
+			Button:           color.NRGBA{220, 252, 231, 255},
+			InputBackground:  color.NRGBA{226, 246, 234, 255},
+			InputBorder:      color.NRGBA{110, 180, 150, 255},
+			HeaderBackground: color.NRGBA{187, 247, 208, 255},
+			Selection:        color.NRGBA{167, 243, 208, 255},
+			Hover:            color.NRGBA{209, 250, 229, 255},
+			Focus:            color.NRGBA{5, 150, 105, 88},
+			Separator:        color.NRGBA{187, 247, 208, 255},
+			Placeholder:      color.NRGBA{71, 125, 99, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 45},
+		},
+		Dark: appThemePalette{
+			Primary:          color.NRGBA{52, 211, 153, 255},
+			Foreground:       color.NRGBA{240, 253, 244, 255},
+			ForegroundOnKey:  color.NRGBA{5, 46, 22, 255},
+			Background:       color.NRGBA{6, 33, 25, 255},
+			Button:           color.NRGBA{15, 61, 46, 255},
+			InputBackground:  color.NRGBA{20, 73, 55, 255},
+			InputBorder:      color.NRGBA{34, 110, 82, 255},
+			HeaderBackground: color.NRGBA{7, 46, 34, 255},
+			Selection:        color.NRGBA{6, 95, 70, 255},
+			Hover:            color.NRGBA{4, 120, 87, 255},
+			Focus:            color.NRGBA{52, 211, 153, 92},
+			Separator:        color.NRGBA{32, 93, 68, 255},
+			Placeholder:      color.NRGBA{134, 239, 172, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 120},
+		},
+	},
+	{
+		ID:   appThemeSchemeViolet,
+		Name: "紫罗兰",
+		Light: appThemePalette{
+			Primary:          color.NRGBA{109, 40, 217, 255},
+			Foreground:       color.NRGBA{24, 24, 27, 255},
+			ForegroundOnKey:  color.NRGBA{255, 255, 255, 255},
+			Background:       color.NRGBA{250, 245, 255, 255},
+			Button:           color.NRGBA{237, 233, 254, 255},
+			InputBackground:  color.NRGBA{245, 243, 255, 255},
+			InputBorder:      color.NRGBA{167, 139, 250, 255},
+			HeaderBackground: color.NRGBA{221, 214, 254, 255},
+			Selection:        color.NRGBA{196, 181, 253, 255},
+			Hover:            color.NRGBA{237, 233, 254, 255},
+			Focus:            color.NRGBA{124, 58, 237, 88},
+			Separator:        color.NRGBA{221, 214, 254, 255},
+			Placeholder:      color.NRGBA{109, 92, 150, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 45},
+		},
+		Dark: appThemePalette{
+			Primary:          color.NRGBA{167, 139, 250, 255},
+			Foreground:       color.NRGBA{250, 245, 255, 255},
+			ForegroundOnKey:  color.NRGBA{30, 27, 75, 255},
+			Background:       color.NRGBA{30, 27, 75, 255},
+			Button:           color.NRGBA{46, 36, 92, 255},
+			InputBackground:  color.NRGBA{54, 45, 110, 255},
+			InputBorder:      color.NRGBA{91, 72, 153, 255},
+			HeaderBackground: color.NRGBA{37, 31, 83, 255},
+			Selection:        color.NRGBA{91, 33, 182, 255},
+			Hover:            color.NRGBA{76, 29, 149, 255},
+			Focus:            color.NRGBA{167, 139, 250, 92},
+			Separator:        color.NRGBA{76, 58, 126, 255},
+			Placeholder:      color.NRGBA{196, 181, 253, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 120},
+		},
+	},
+	{
+		ID:   appThemeSchemeAmber,
+		Name: "暖橙",
+		Light: appThemePalette{
+			Primary:          color.NRGBA{194, 65, 12, 255},
+			Foreground:       color.NRGBA{28, 25, 23, 255},
+			ForegroundOnKey:  color.NRGBA{255, 255, 255, 255},
+			Background:       color.NRGBA{255, 247, 237, 255},
+			Button:           color.NRGBA{254, 215, 170, 255},
+			InputBackground:  color.NRGBA{255, 237, 213, 255},
+			InputBorder:      color.NRGBA{251, 146, 60, 255},
+			HeaderBackground: color.NRGBA{253, 186, 116, 255},
+			Selection:        color.NRGBA{254, 215, 170, 255},
+			Hover:            color.NRGBA{255, 237, 213, 255},
+			Focus:            color.NRGBA{234, 88, 12, 88},
+			Separator:        color.NRGBA{253, 186, 116, 255},
+			Placeholder:      color.NRGBA{124, 75, 34, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 45},
+		},
+		Dark: appThemePalette{
+			Primary:          color.NRGBA{251, 146, 60, 255},
+			Foreground:       color.NRGBA{255, 247, 237, 255},
+			ForegroundOnKey:  color.NRGBA{67, 20, 7, 255},
+			Background:       color.NRGBA{45, 26, 14, 255},
+			Button:           color.NRGBA{67, 38, 20, 255},
+			InputBackground:  color.NRGBA{82, 49, 26, 255},
+			InputBorder:      color.NRGBA{124, 69, 32, 255},
+			HeaderBackground: color.NRGBA{57, 32, 17, 255},
+			Selection:        color.NRGBA{154, 52, 18, 255},
+			Hover:            color.NRGBA{124, 45, 18, 255},
+			Focus:            color.NRGBA{251, 146, 60, 92},
+			Separator:        color.NRGBA{103, 62, 34, 255},
+			Placeholder:      color.NRGBA{253, 186, 116, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 120},
+		},
+	},
+	{
+		ID:   appThemeSchemeCyber,
+		Name: "赛博青",
+		Light: appThemePalette{
+			Primary:          color.NRGBA{14, 116, 144, 255},
+			Foreground:       color.NRGBA{8, 47, 73, 255},
+			ForegroundOnKey:  color.NRGBA{255, 255, 255, 255},
+			Background:       color.NRGBA{236, 254, 255, 255},
+			Button:           color.NRGBA{207, 250, 254, 255},
+			InputBackground:  color.NRGBA{224, 247, 250, 255},
+			InputBorder:      color.NRGBA{34, 184, 207, 255},
+			HeaderBackground: color.NRGBA{165, 243, 252, 255},
+			Selection:        color.NRGBA{103, 232, 249, 255},
+			Hover:            color.NRGBA{207, 250, 254, 255},
+			Focus:            color.NRGBA{8, 145, 178, 88},
+			Separator:        color.NRGBA{165, 243, 252, 255},
+			Placeholder:      color.NRGBA{21, 94, 117, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 45},
+		},
+		Dark: appThemePalette{
+			Primary:          color.NRGBA{34, 211, 238, 255},
+			Foreground:       color.NRGBA{236, 254, 255, 255},
+			ForegroundOnKey:  color.NRGBA{8, 51, 68, 255},
+			Background:       color.NRGBA{8, 35, 45, 255},
+			Button:           color.NRGBA{12, 55, 68, 255},
+			InputBackground:  color.NRGBA{16, 70, 84, 255},
+			InputBorder:      color.NRGBA{22, 112, 130, 255},
+			HeaderBackground: color.NRGBA{10, 48, 61, 255},
+			Selection:        color.NRGBA{14, 116, 144, 255},
+			Hover:            color.NRGBA{21, 94, 117, 255},
+			Focus:            color.NRGBA{34, 211, 238, 92},
+			Separator:        color.NRGBA{21, 94, 117, 255},
+			Placeholder:      color.NRGBA{103, 232, 249, 255},
+			Shadow:           color.NRGBA{0, 0, 0, 120},
+		},
+	},
+}
+
+func themeSchemeDisplayOptions() []string {
+	return themeSchemeDisplayOptionsFor(currentCustomThemeSchemes)
+}
+
+func themeSchemeDisplayOptionsFor(customSchemes []CustomThemeSchemeConfig) []string {
+	customSchemes = normalizeCustomThemeSchemes(customSchemes)
+	options := make([]string, 0, len(appThemeSchemes)+len(customSchemes))
+	for _, scheme := range appThemeSchemes {
+		options = append(options, scheme.Name)
+	}
+	for _, scheme := range customSchemes {
+		options = append(options, customThemeSchemeDisplayName(scheme.Name))
+	}
+	return options
+}
+
+func normalizeThemeMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case appThemeModeLight, "浅色":
+		return appThemeModeLight
+	case appThemeModeDark, "深色":
+		return appThemeModeDark
+	default:
+		return appThemeModeSystem
+	}
+}
+
+func themeModeDisplay(mode string) string {
+	switch normalizeThemeMode(mode) {
+	case appThemeModeLight:
+		return "浅色"
+	case appThemeModeDark:
+		return "深色"
+	default:
+		return "跟随系统"
+	}
+}
+
+func themeModeFromDisplay(display string) string {
+	return normalizeThemeMode(display)
+}
+
+func themeModeIsDark(mode string, systemVariant fyne.ThemeVariant) bool {
+	switch normalizeThemeMode(mode) {
+	case appThemeModeLight:
+		return false
+	case appThemeModeDark:
+		return true
+	default:
+		return systemVariant == theme.VariantDark
+	}
+}
+
+func normalizeThemeScheme(scheme string) string {
+	return normalizeThemeSchemeWithCustom(scheme, currentCustomThemeSchemes)
+}
+
+func normalizeThemeSchemeWithCustom(scheme string, customSchemes []CustomThemeSchemeConfig) string {
+	trimmed := strings.TrimSpace(scheme)
+	lower := strings.ToLower(trimmed)
+	for _, item := range appThemeSchemes {
+		if lower == item.ID || trimmed == item.Name {
+			return item.ID
+		}
+	}
+
+	for _, item := range normalizeCustomThemeSchemes(customSchemes) {
+		displayName := customThemeSchemeDisplayName(item.Name)
+		if trimmed == item.ID || lower == strings.ToLower(item.ID) || trimmed == displayName || trimmed == item.Name {
+			return item.ID
+		}
+	}
+	return appThemeSchemeClassicBlue
+}
+
+func themeSchemeDisplay(scheme string) string {
+	return themeSchemeDisplayFor(scheme, currentCustomThemeSchemes)
+}
+
+func themeSchemeDisplayFor(scheme string, customSchemes []CustomThemeSchemeConfig) string {
+	id := normalizeThemeSchemeWithCustom(scheme, customSchemes)
+	for _, item := range appThemeSchemes {
+		if item.ID == id {
+			return item.Name
+		}
+	}
+	for _, item := range normalizeCustomThemeSchemes(customSchemes) {
+		if item.ID == id {
+			return customThemeSchemeDisplayName(item.Name)
+		}
+	}
+	return appThemeSchemes[0].Name
+}
+
+func themeSchemeFromDisplay(display string) string {
+	return themeSchemeFromDisplayFor(display, currentCustomThemeSchemes)
+}
+
+func themeSchemeFromDisplayFor(display string, customSchemes []CustomThemeSchemeConfig) string {
+	return normalizeThemeSchemeWithCustom(display, customSchemes)
+}
+
+func nextThemeScheme(scheme string) string {
+	return nextThemeSchemeWithCustom(scheme, currentCustomThemeSchemes)
+}
+
+func nextThemeSchemeWithCustom(scheme string, customSchemes []CustomThemeSchemeConfig) string {
+	schemes := allThemeSchemes(customSchemes)
+	id := normalizeThemeSchemeWithCustom(scheme, customSchemes)
+	for i, item := range schemes {
+		if item.ID == id {
+			return schemes[(i+1)%len(schemes)].ID
+		}
+	}
+	return schemes[0].ID
+}
+
+func themeSchemeByID(scheme string) appThemeScheme {
+	return themeSchemeByIDWithCustom(scheme, currentCustomThemeSchemes)
+}
+
+func themeSchemeByIDWithCustom(scheme string, customSchemes []CustomThemeSchemeConfig) appThemeScheme {
+	id := normalizeThemeSchemeWithCustom(scheme, customSchemes)
+	for _, item := range allThemeSchemes(customSchemes) {
+		if item.ID == id {
+			return item
+		}
+	}
+	return appThemeSchemes[0]
+}
+
+func themePaletteFor(scheme string, isDark bool) appThemePalette {
+	return themePaletteForWithCustom(scheme, isDark, currentCustomThemeSchemes)
+}
+
+func themePaletteForWithCustom(scheme string, isDark bool, customSchemes []CustomThemeSchemeConfig) appThemePalette {
+	item := themeSchemeByIDWithCustom(scheme, customSchemes)
+	if isDark {
+		return item.Dark
+	}
+	return item.Light
+}
+
+func currentThemePalette(isDark bool) appThemePalette {
+	return themePaletteFor(currentThemeSchemeID, isDark)
+}
+
+func allThemeSchemes(customSchemes []CustomThemeSchemeConfig) []appThemeScheme {
+	customSchemes = normalizeCustomThemeSchemes(customSchemes)
+	schemes := make([]appThemeScheme, 0, len(appThemeSchemes)+len(customSchemes))
+	schemes = append(schemes, appThemeSchemes...)
+	for _, scheme := range customSchemes {
+		schemes = append(schemes, customThemeSchemeToAppThemeScheme(scheme))
+	}
+	return schemes
+}
+
+func customThemeSchemeToAppThemeScheme(scheme CustomThemeSchemeConfig) appThemeScheme {
+	palette := paletteFromCustomThemeScheme(scheme)
+	return appThemeScheme{
+		ID:    scheme.ID,
+		Name:  customThemeSchemeDisplayName(scheme.Name),
+		Light: palette,
+		Dark:  palette,
+	}
+}
+
+func paletteFromCustomThemeScheme(scheme CustomThemeSchemeConfig) appThemePalette {
+	base := appThemeSchemes[0].Light
+	primary := mustThemeColor(scheme.Primary, base.Primary)
+	background := mustThemeColor(scheme.Background, base.Background)
+	button := mustThemeColor(scheme.Button, base.Button)
+	header := mustThemeColor(scheme.HeaderBackground, base.HeaderBackground)
+	foreground := contrastNRGBA(background)
+
+	return appThemePalette{
+		Primary:          primary,
+		Foreground:       foreground,
+		ForegroundOnKey:  contrastNRGBA(primary),
+		Background:       background,
+		Button:           button,
+		InputBackground:  blendNRGBA(background, button, 0.65),
+		InputBorder:      blendNRGBA(background, primary, 0.55),
+		HeaderBackground: header,
+		Selection:        blendNRGBA(background, primary, 0.35),
+		Hover:            blendNRGBA(button, primary, 0.18),
+		Focus:            withAlphaNRGBA(primary, 92),
+		Separator:        blendNRGBA(background, primary, 0.25),
+		Placeholder:      blendNRGBA(background, foreground, 0.58),
+		Shadow:           color.NRGBA{0, 0, 0, customThemeShadowAlpha(background)},
+	}
+}
+
+func customThemeSchemeDisplayName(name string) string {
+	return appThemeCustomSchemeDisplayPrefix + strings.TrimSpace(name)
+}
+
+func normalizeCustomThemeSchemes(schemes []CustomThemeSchemeConfig) []CustomThemeSchemeConfig {
+	usedIDs := map[string]bool{}
+	usedNames := map[string]bool{}
+	normalized := make([]CustomThemeSchemeConfig, 0, len(schemes))
+	for _, scheme := range schemes {
+		primary, okPrimary := normalizeThemeHex(scheme.Primary)
+		background, okBackground := normalizeThemeHex(scheme.Background)
+		button, okButton := normalizeThemeHex(scheme.Button)
+		header, okHeader := normalizeThemeHex(scheme.HeaderBackground)
+		if !okPrimary || !okBackground || !okButton || !okHeader {
+			continue
+		}
+
+		id := strings.TrimSpace(scheme.ID)
+		if !strings.HasPrefix(strings.ToLower(id), appThemeCustomSchemePrefix) || usedIDs[id] {
+			id = nextCustomThemeSchemeID(usedIDs)
+		}
+		usedIDs[id] = true
+
+		name := uniqueCustomThemeSchemeName(scheme.Name, len(normalized)+1, usedNames)
+		normalized = append(normalized, CustomThemeSchemeConfig{
+			ID:               id,
+			Name:             name,
+			Primary:          primary,
+			Background:       background,
+			Button:           button,
+			HeaderBackground: header,
+		})
+	}
+	return normalized
+}
+
+func validateCustomThemeSchemes(schemes []CustomThemeSchemeConfig) error {
+	for _, scheme := range schemes {
+		name := strings.TrimSpace(scheme.Name)
+		if name == "" {
+			return fmt.Errorf("自定义配色方案名称不能为空")
+		}
+		fields := []struct {
+			label string
+			value string
+		}{
+			{label: "主色", value: scheme.Primary},
+			{label: "背景", value: scheme.Background},
+			{label: "按钮", value: scheme.Button},
+			{label: "表头", value: scheme.HeaderBackground},
+		}
+		for _, field := range fields {
+			if _, ok := normalizeThemeHex(field.value); !ok {
+				return fmt.Errorf("自定义配色 %q 的%s需要输入 #RRGGBB 格式颜色", name, field.label)
+			}
+		}
+	}
+	return nil
+}
+
+func copyCustomThemeSchemes(schemes []CustomThemeSchemeConfig) []CustomThemeSchemeConfig {
+	copied := make([]CustomThemeSchemeConfig, len(schemes))
+	copy(copied, schemes)
+	return copied
+}
+
+func nextCustomThemeSchemeID(usedIDs map[string]bool) string {
+	for i := 1; ; i++ {
+		id := fmt.Sprintf("%s%d", appThemeCustomSchemePrefix, i)
+		if !usedIDs[id] {
+			return id
+		}
+	}
+}
+
+func uniqueCustomThemeSchemeName(name string, index int, usedNames map[string]bool) string {
+	base := strings.TrimSpace(name)
+	if base == "" {
+		base = fmt.Sprintf("自定义配色%d", index)
+	}
+	candidate := base
+	for i := 2; usedNames[candidate]; i++ {
+		candidate = fmt.Sprintf("%s %d", base, i)
+	}
+	usedNames[candidate] = true
+	return candidate
+}
+
+func normalizeThemeHex(value string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	trimmed = strings.TrimPrefix(trimmed, "#")
+	if len(trimmed) != 6 {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(trimmed, 16, 32); err != nil {
+		return "", false
+	}
+	return "#" + strings.ToUpper(trimmed), true
+}
+
+func colorFromThemeHex(value string) (color.NRGBA, bool) {
+	hex, ok := normalizeThemeHex(value)
+	if !ok {
+		return color.NRGBA{}, false
+	}
+	parsed, err := strconv.ParseUint(strings.TrimPrefix(hex, "#"), 16, 32)
+	if err != nil {
+		return color.NRGBA{}, false
+	}
+	return color.NRGBA{R: uint8(parsed >> 16), G: uint8(parsed >> 8), B: uint8(parsed), A: 255}, true
+}
+
+func mustThemeColor(value string, fallback color.NRGBA) color.NRGBA {
+	if c, ok := colorFromThemeHex(value); ok {
+		return c
+	}
+	return fallback
+}
+
+func hexFromColor(c color.Color) string {
+	r, g, b, _ := c.RGBA()
+	return fmt.Sprintf("#%02X%02X%02X", uint8(r>>8), uint8(g>>8), uint8(b>>8))
+}
+
+func contrastNRGBA(c color.NRGBA) color.NRGBA {
+	if colorBrightness(c) > 128 {
+		return color.NRGBA{0, 0, 0, 255}
+	}
+	return color.NRGBA{255, 255, 255, 255}
+}
+
+func colorBrightness(c color.NRGBA) float64 {
+	return 0.299*float64(c.R) + 0.587*float64(c.G) + 0.114*float64(c.B)
+}
+
+func blendNRGBA(base, overlay color.NRGBA, overlayRatio float64) color.NRGBA {
+	if overlayRatio < 0 {
+		overlayRatio = 0
+	}
+	if overlayRatio > 1 {
+		overlayRatio = 1
+	}
+	baseRatio := 1 - overlayRatio
+	return color.NRGBA{
+		R: uint8(float64(base.R)*baseRatio + float64(overlay.R)*overlayRatio),
+		G: uint8(float64(base.G)*baseRatio + float64(overlay.G)*overlayRatio),
+		B: uint8(float64(base.B)*baseRatio + float64(overlay.B)*overlayRatio),
+		A: 255,
+	}
+}
+
+func withAlphaNRGBA(c color.NRGBA, alpha uint8) color.NRGBA {
+	c.A = alpha
+	return c
+}
+
+func customThemeShadowAlpha(background color.NRGBA) uint8 {
+	if colorBrightness(background) > 128 {
+		return 45
+	}
+	return 120
+}
+
+func copyShortcutConfig(shortcuts map[string]string) map[string]string {
+	copied := make(map[string]string, len(shortcuts))
+	for key, value := range shortcuts {
+		copied[key] = value
+	}
+	return copied
+}
+
+func normalizeShortcutConfig(shortcuts map[string]string) map[string]string {
+	normalized := copyShortcutConfig(shortcuts)
+	if normalized == nil {
+		normalized = make(map[string]string, len(defaultShortcutTexts))
+	}
+	for key, value := range defaultShortcutTexts {
+		if _, ok := normalized[key]; !ok {
+			normalized[key] = value
+		}
+	}
+	return normalized
+}
+
+func shortcutText(shortcuts map[string]string, id string) string {
+	if value, ok := shortcuts[id]; ok {
+		return strings.TrimSpace(value)
+	}
+	return defaultShortcutTexts[id]
+}
+
+func commandDefinitionByID(id string) (commandDefinition, bool) {
+	for _, def := range commandDefinitions {
+		if def.ID == id {
+			return def, true
+		}
+	}
+	return commandDefinition{}, false
+}
+
+func commandDefinitionOrder(id string) int {
+	for i, def := range commandDefinitions {
+		if def.ID == id {
+			return i
+		}
+	}
+	return len(commandDefinitions)
+}
+
+func defaultToolButtonConfigs() []ToolButtonConfig {
+	buttons := make([]ToolButtonConfig, 0)
+	for _, def := range commandDefinitions {
+		if !def.DefaultToolbar {
+			continue
+		}
+		buttons = append(buttons, ToolButtonConfig{
+			CommandID: def.ID,
+			Visible:   true,
+			Order:     len(buttons) + 1,
+		})
+	}
+	return buttons
+}
+
+func copyToolButtonConfigs(buttons []ToolButtonConfig) []ToolButtonConfig {
+	copied := make([]ToolButtonConfig, len(buttons))
+	copy(copied, buttons)
+	return copied
+}
+
+func normalizeToolButtonConfigs(buttons []ToolButtonConfig) []ToolButtonConfig {
+	if len(buttons) == 0 {
+		return defaultToolButtonConfigs()
+	}
+
+	normalized := make([]ToolButtonConfig, 0, len(commandDefinitions))
+	seen := make(map[string]bool, len(buttons))
+	nextOrder := 1
+	for _, button := range buttons {
+		id := strings.TrimSpace(button.CommandID)
+		def, ok := commandDefinitionByID(id)
+		if !ok || seen[id] {
+			continue
+		}
+		order := button.Order
+		if order <= 0 {
+			order = nextOrder
+		}
+		nextOrder = max(nextOrder, order+1)
+		label := strings.TrimSpace(button.Label)
+		if label == def.Label {
+			label = ""
+		}
+		normalized = append(normalized, ToolButtonConfig{
+			CommandID: id,
+			Label:     label,
+			Visible:   button.Visible,
+			Order:     order,
+		})
+		seen[id] = true
+	}
+
+	for _, button := range defaultToolButtonConfigs() {
+		if seen[button.CommandID] {
+			continue
+		}
+		button.Order = nextOrder
+		nextOrder++
+		normalized = append(normalized, button)
+	}
+
+	sort.SliceStable(normalized, func(i, j int) bool {
+		if normalized[i].Order == normalized[j].Order {
+			return commandDefinitionOrder(normalized[i].CommandID) < commandDefinitionOrder(normalized[j].CommandID)
+		}
+		return normalized[i].Order < normalized[j].Order
+	})
+	for i := range normalized {
+		normalized[i].Order = i + 1
+	}
+	return normalized
+}
+
+func toolButtonLabel(button ToolButtonConfig) string {
+	if label := strings.TrimSpace(button.Label); label != "" {
+		return label
+	}
+	if def, ok := commandDefinitionByID(button.CommandID); ok {
+		return def.Label
+	}
+	return button.CommandID
+}
+
+func normalizeShortcutKey(text string) (fyne.KeyName, string, bool) {
+	key := strings.TrimSpace(text)
+	if key == "" {
+		return fyne.KeyUnknown, "", false
+	}
+	upper := strings.ToUpper(key)
+	if len([]rune(upper)) == 1 {
+		r := []rune(upper)[0]
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return fyne.KeyName(string(r)), string(r), true
+		}
+	}
+	if strings.HasPrefix(upper, "F") {
+		if value, err := strconv.Atoi(strings.TrimPrefix(upper, "F")); err == nil && value >= 1 && value <= 12 {
+			return fyne.KeyName(upper), upper, true
+		}
+	}
+
+	switch strings.ToLower(key) {
+	case "space", "空格":
+		return fyne.KeySpace, "Space", true
+	case "enter", "return", "回车":
+		return fyne.KeyReturn, "Enter", true
+	case "esc", "escape":
+		return fyne.KeyEscape, "Escape", true
+	case "up", "arrowup", "上":
+		return fyne.KeyUp, "Up", true
+	case "down", "arrowdown", "下":
+		return fyne.KeyDown, "Down", true
+	case "left", "arrowleft", "左":
+		return fyne.KeyLeft, "Left", true
+	case "right", "arrowright", "右":
+		return fyne.KeyRight, "Right", true
+	case "tab":
+		return fyne.KeyTab, "Tab", true
+	}
+	return fyne.KeyUnknown, "", false
+}
+
+func shortcutForKey(modifier fyne.KeyModifier, key fyne.KeyName) fyne.Shortcut {
+	if modifier == fyne.KeyModifierShortcutDefault {
+		switch key {
+		case fyne.KeyA:
+			return &fyne.ShortcutSelectAll{}
+		case fyne.KeyZ:
+			return &fyne.ShortcutUndo{}
+		case fyne.KeyY:
+			return &fyne.ShortcutRedo{}
+		}
+	}
+	return &desktop.CustomShortcut{KeyName: key, Modifier: modifier}
+}
+
+func formatShortcutText(modifier fyne.KeyModifier, keyLabel string) string {
+	parts := make([]string, 0, 5)
+	if modifier&fyne.KeyModifierControl != 0 {
+		parts = append(parts, "Ctrl")
+	}
+	if modifier&fyne.KeyModifierShift != 0 {
+		parts = append(parts, "Shift")
+	}
+	if modifier&fyne.KeyModifierAlt != 0 {
+		parts = append(parts, "Alt")
+	}
+	if modifier&fyne.KeyModifierSuper != 0 {
+		parts = append(parts, "Super")
+	}
+	parts = append(parts, keyLabel)
+	return strings.Join(parts, "+")
+}
+
+func shortcutKeyLabel(key fyne.KeyName) (string, bool) {
+	if key == fyne.KeyUnknown || key == "" {
+		return "", false
+	}
+
+	text := string(key)
+	upper := strings.ToUpper(text)
+	if len([]rune(upper)) == 1 {
+		r := []rune(upper)[0]
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return string(r), true
+		}
+	}
+
+	switch key {
+	case fyne.KeySpace:
+		return "Space", true
+	case fyne.KeyReturn, fyne.KeyEnter:
+		return "Enter", true
+	case fyne.KeyEscape:
+		return "Escape", true
+	case fyne.KeyUp:
+		return "Up", true
+	case fyne.KeyDown:
+		return "Down", true
+	case fyne.KeyLeft:
+		return "Left", true
+	case fyne.KeyRight:
+		return "Right", true
+	case fyne.KeyTab:
+		return "Tab", true
+	}
+	if strings.HasPrefix(text, "F") {
+		if value, err := strconv.Atoi(strings.TrimPrefix(text, "F")); err == nil && value >= 1 && value <= 12 {
+			return text, true
+		}
+	}
+	return "", false
+}
+
+func shortcutTextFromKeyboardShortcut(shortcut fyne.KeyboardShortcut) (string, bool) {
+	modifier := shortcut.Mod()
+	if modifier == fyne.KeyModifierShortcutDefault {
+		modifier = fyne.KeyModifierControl
+	}
+	keyLabel, ok := shortcutKeyLabel(shortcut.Key())
+	if !ok || modifier == 0 {
+		return "", false
+	}
+	return formatShortcutText(modifier, keyLabel), true
+}
+
+func parseShortcutText(text string) (fyne.Shortcut, string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, "", nil
+	}
+
+	var modifier fyne.KeyModifier
+	var key fyne.KeyName
+	keyLabel := ""
+	for _, rawPart := range strings.Split(text, "+") {
+		part := strings.TrimSpace(rawPart)
+		if part == "" {
+			return nil, "", fmt.Errorf("快捷键格式无效")
+		}
+		switch strings.ToLower(part) {
+		case "ctrl", "control", "控制":
+			modifier |= fyne.KeyModifierControl
+		case "shift":
+			modifier |= fyne.KeyModifierShift
+		case "alt":
+			modifier |= fyne.KeyModifierAlt
+		case "super", "win", "windows", "meta", "cmd", "command":
+			modifier |= fyne.KeyModifierSuper
+		default:
+			if key != "" && key != fyne.KeyUnknown {
+				return nil, "", fmt.Errorf("快捷键只能包含一个主按键")
+			}
+			normalizedKey, normalizedLabel, ok := normalizeShortcutKey(part)
+			if !ok {
+				return nil, "", fmt.Errorf("不支持的按键: %s", part)
+			}
+			key = normalizedKey
+			keyLabel = normalizedLabel
+		}
+	}
+	if modifier == 0 {
+		return nil, "", fmt.Errorf("快捷键至少需要包含 Ctrl、Shift、Alt 或 Super 中的一个组合键")
+	}
+	if key == "" || key == fyne.KeyUnknown {
+		return nil, "", fmt.Errorf("快捷键缺少主按键")
+	}
+	return shortcutForKey(modifier, key), formatShortcutText(modifier, keyLabel), nil
+}
+
+func initialWindowSize(widthRatio, heightRatio float32) fyne.Size {
+	const (
+		fallbackWidth  = 1000
+		fallbackHeight = 650
+	)
+
+	screenWidth, screenHeight := screenSizePixels()
+	if screenWidth <= 0 || screenHeight <= 0 {
+		return fyne.NewSize(fallbackWidth, fallbackHeight)
+	}
+
+	scale := screenScale()
+	if scale <= 0 {
+		scale = 1
+	}
+
+	return fyne.NewSize(
+		float32(screenWidth)/scale*widthRatio,
+		float32(screenHeight)/scale*heightRatio,
+	)
+}
+
+func splitOffsetForFixedRightWidth(totalWidth, leftWidth, rightWidth float32) float64 {
+	availableWidth := totalWidth - leftWidth
+	if availableWidth <= rightWidth || availableWidth <= 0 {
+		return 0.5
+	}
+	offset := (availableWidth - rightWidth) / availableWidth
+	if offset < 0.05 {
+		return 0.05
+	}
+	if offset > 0.95 {
+		return 0.95
+	}
+	return float64(offset)
+}
+
+func normalizeSplitOffset(offset float64) float64 {
+	if math.IsNaN(offset) || offset <= 0 || offset >= 1 {
+		return 0
+	}
+	return offset
+}
+
+func initialRightPanelSplitOffset(config UserConfig, totalWidth, leftWidth, rightWidth float32) float64 {
+	if offset := normalizeSplitOffset(config.RightPanelSplitOffset); offset > 0 {
+		return offset
+	}
+	return splitOffsetForFixedRightWidth(totalWidth, leftWidth, rightWidth)
+}
+
+func normalizeFontLibPaths(paths []string) []string {
+	result := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		key := strings.ToLower(filepath.Clean(path))
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, path)
+	}
+	return result
+}
+
+func addFontLibPath(paths []string, path string) []string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return normalizeFontLibPaths(paths)
+	}
+	return normalizeFontLibPaths(append([]string{path}, paths...))
+}
+
+func removeFontLibPath(paths []string, path string) []string {
+	result := make([]string, 0, len(paths))
+	for _, item := range paths {
+		if !strings.EqualFold(strings.TrimSpace(item), strings.TrimSpace(path)) {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func normalizeFontLibWindowWidth(width float32) float32 {
+	if math.IsNaN(float64(width)) || width < 600 || width > 4000 {
+		return 0
+	}
+	return width
+}
+
+func initialFontLibWindowSize(config UserConfig) fyne.Size {
+	return fontLibWindowSizeForScreen(config.FontLibWindowWidth, initialWindowSize(1, 1))
+}
+
+func fontLibWindowSizeForScreen(savedWidth float32, screen fyne.Size) fyne.Size {
+	const aspectRatio = float32(1.28)
+	if screen.Width <= 0 || screen.Height <= 0 {
+		screen = fyne.NewSize(1000, 650)
+	}
+	maxWidth := screen.Width * 0.9
+	maxHeight := screen.Height * 0.9
+	width := float32(math.Sqrt(0.5 * float64(aspectRatio*screen.Width*screen.Height)))
+	if width > maxWidth {
+		width = maxWidth
+	}
+	if heightLimitedWidth := maxHeight * aspectRatio; width > heightLimitedWidth {
+		width = heightLimitedWidth
+	}
+	if saved := normalizeFontLibWindowWidth(savedWidth); saved > 0 {
+		if saved < width {
+			width = saved
+		}
+	}
+	return fyne.NewSize(width, width/aspectRatio)
+}
+
+func initialFontLibRightSplitOffset(config UserConfig) float64 {
+	if offset := normalizeSplitOffset(config.FontLibRightSplit); offset > 0 {
+		return offset
+	}
+	return 0.68
+}
+
+// 固定高度的容器布局
+type fixedHeightContainer struct {
+	widget.BaseWidget
+	content fyne.CanvasObject
+	height  float32
+}
+
+func newFixedHeightContainer(content fyne.CanvasObject, height float32) *fixedHeightContainer {
+	c := &fixedHeightContainer{content: content, height: height}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *fixedHeightContainer) CreateRenderer() fyne.WidgetRenderer {
+	return &fixedHeightRenderer{container: c}
+}
+
+type fixedHeightRenderer struct {
+	container *fixedHeightContainer
+}
+
+func (r *fixedHeightRenderer) Layout(size fyne.Size) {
+	r.container.content.Resize(fyne.NewSize(size.Width, r.container.height))
+	r.container.content.Move(fyne.NewPos(0, 0))
+}
+
+func (r *fixedHeightRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(r.container.content.MinSize().Width, r.container.height)
+}
+
+func (r *fixedHeightRenderer) Refresh() {
+	r.container.content.Refresh()
+}
+
+func (r *fixedHeightRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.container.content}
+}
+
+func (r *fixedHeightRenderer) Destroy() {}
+
+// 获取当前主题下适合的文字颜色
+func getTextColor(isDark bool) color.Color {
+	return currentThemePalette(isDark).Foreground
+}
+
+// 获取当前主题下适合的表头背景色
+func getHeaderBgColor(isDark bool) color.Color {
+	return currentThemePalette(isDark).HeaderBackground
+}
+
+// 判断颜色亮度，决定是使用白色还是黑色文字
+func getContrastColor(bgColor color.Color) color.Color {
+	r, g, b, _ := bgColor.RGBA()
+	// 转换为0-255范围
+	r8 := uint8(r >> 8)
+	g8 := uint8(g >> 8)
+	b8 := uint8(b >> 8)
+
+	// 计算亮度 (亮度公式: 0.299*R + 0.587*G + 0.114*B)
+	brightness := 0.299*float64(r8) + 0.587*float64(g8) + 0.114*float64(b8)
+
+	// 如果亮度大于阈值，使用黑色，否则使用白色
+	if brightness > 128 {
+		return color.Black
+	}
+	return color.White
+}
+
+// 自定义主题，按当前明暗模式叠加应用配色方案。
+type myTheme struct {
+	fyne.Theme
+	palette appThemePalette
+	isDark  bool
+}
+
+func (m myTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNamePrimary, theme.ColorNameHyperlink:
+		return m.palette.Primary
+	case theme.ColorNameForeground:
+		return m.palette.Foreground
+	case theme.ColorNameForegroundOnPrimary:
+		return m.palette.ForegroundOnKey
+	case theme.ColorNameBackground:
+		return m.palette.Background
+	case theme.ColorNameButton, theme.ColorNameMenuBackground:
+		return m.palette.Button
+	case theme.ColorNameOverlayBackground:
+		return m.palette.Background
+	case theme.ColorNameInputBackground:
+		return m.palette.InputBackground
+	case theme.ColorNameInputBorder:
+		return m.palette.InputBorder
+	case theme.ColorNameHeaderBackground:
+		return m.palette.HeaderBackground
+	case theme.ColorNameSelection:
+		return m.palette.Selection
+	case theme.ColorNameHover:
+		return m.palette.Hover
+	case theme.ColorNameFocus, theme.ColorNamePressed:
+		return m.palette.Focus
+	case theme.ColorNameSeparator:
+		return m.palette.Separator
+	case theme.ColorNamePlaceHolder:
+		return m.palette.Placeholder
+	case theme.ColorNameShadow:
+		return m.palette.Shadow
+	}
+
+	activeVariant := theme.VariantLight
+	if m.isDark {
+		activeVariant = theme.VariantDark
+	}
+	return theme.DefaultTheme().Color(name, activeVariant)
+}
+
+// 设置尺寸
+func (m myTheme) Size(name fyne.ThemeSizeName) float32 {
+	// 设置滚动条始终为粗的样式
+	if name == theme.SizeNameScrollBar {
+		return 10
+	}
+	if name == theme.SizeNameScrollBarSmall {
+		return 10
+	}
+
+	// 其他尺寸使用默认值
+	return theme.DefaultTheme().Size(name)
+}
+
+// 自定义主题，只修改需要的主题属性
+func newMyTheme(scheme string, isDark bool) fyne.Theme {
+	return &myTheme{
+		Theme:   theme.DefaultTheme(),
+		palette: themePaletteFor(scheme, isDark),
+		isDark:  isDark,
+	}
+}
+
+// 自定义可点击表格行
+type ClickableTableRow struct {
+	widget.BaseWidget
+	background    *canvas.Rectangle
+	content       *fyne.Container
+	onTapped      func()
+	onDoubleTap   func()
+	id            int
+	isHighlighted bool
+}
+
+// 创建表格标题更新函数 - 前向声明
+var updateTableHeader func()
+
+// 创建表格选中更新函数 - 前向声明
+var updateTableSelection func()
+var tableContent *widget.List
+var tableHeader *fyne.Container
+var headerBg *canvas.Rectangle
+var idHeader, posHeader, colorHeader, statusHeader *canvas.Text
+var linkedColorPointIndex = -1
+var linkedColorPointFlashVisible bool
+var linkedColorPointFlashSeq uint64
+
+func defaultUserConfig() UserConfig {
+	return UserConfig{
+		Precision:            "0.90",
+		UniformOffset:        "202020",
+		PickCount:            "20个",
+		PickMode:             "轮廓取点",
+		FunctionMode:         "findMultiColor",
+		DirectionMode:        "0: 从左到右，从上到下",
+		ScreenshotSource:     screenshotSourceADB,
+		RemoteScreenshotPort: 6600,
+		ScreenshotSavePath:   defaultScreenshotSavePath,
+		LogEnabled:           false,
+		ThemeMode:            appThemeModeSystem,
+		ThemeScheme:          appThemeSchemeClassicBlue,
+		ShowMagnifier:        true,
+		AutoCopyRange:        true,
+		ApplyRange:           false,
+		GridMode:             false,
+		GridCols:             4,
+		GridRows:             4,
+		GridSpacing:          7,
+
+		FormatTemplates: defaultAPIFormatTemplates(),
+		Shortcuts:       normalizeShortcutConfig(nil),
+		ToolButtons:     defaultToolButtonConfigs(),
+	}
+}
+
+func validPickMode(mode string) bool {
+	for _, option := range pickModeOptions {
+		if mode == option {
+			return true
+		}
+	}
+	return false
+}
+
+func userConfigPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(configDir, "AutoGo图色助手", "config.json"), nil
+}
+
+func normalizeUserConfig(config UserConfig) UserConfig {
+	defaults := defaultUserConfig()
+	if strings.TrimSpace(config.Precision) == "" {
+		config.Precision = defaults.Precision
+	}
+	if strings.TrimSpace(config.UniformOffset) == "" {
+		config.UniformOffset = defaults.UniformOffset
+	}
+	if strings.TrimSpace(config.PickCount) == "" {
+		config.PickCount = defaults.PickCount
+	}
+	if !validPickMode(config.PickMode) {
+		config.PickMode = defaults.PickMode
+	}
+	if strings.TrimSpace(config.FunctionMode) == "" {
+		config.FunctionMode = defaults.FunctionMode
+	}
+	if strings.TrimSpace(config.DirectionMode) == "" {
+		config.DirectionMode = defaults.DirectionMode
+	}
+	config.ScreenshotSource = normalizeScreenshotSource(config.ScreenshotSource)
+	if config.RemoteScreenshotPort < 1 || config.RemoteScreenshotPort > 65535 {
+		config.RemoteScreenshotPort = defaults.RemoteScreenshotPort
+	}
+	config.ScreenshotSavePath = strings.TrimSpace(config.ScreenshotSavePath)
+	if config.ScreenshotSavePath == "" {
+		config.ScreenshotSavePath = defaults.ScreenshotSavePath
+	}
+	config.ThemeMode = normalizeThemeMode(config.ThemeMode)
+	config.CustomThemeSchemes = normalizeCustomThemeSchemes(config.CustomThemeSchemes)
+	config.ThemeScheme = normalizeThemeSchemeWithCustom(config.ThemeScheme, config.CustomThemeSchemes)
+	if config.GridCols <= 0 {
+		config.GridCols = defaults.GridCols
+	}
+	if config.GridRows <= 0 {
+		config.GridRows = defaults.GridRows
+	}
+	if config.GridSpacing <= 0 {
+		config.GridSpacing = defaults.GridSpacing
+	}
+	config.RightPanelSplitOffset = normalizeSplitOffset(config.RightPanelSplitOffset)
+	config.FontLibWindowWidth = normalizeFontLibWindowWidth(config.FontLibWindowWidth)
+	config.FontLibRightSplit = normalizeSplitOffset(config.FontLibRightSplit)
+	config.FontLibPaths = normalizeFontLibPaths(config.FontLibPaths)
+	config.FormatTemplates = normalizeAPIFormatTemplates(config.FormatTemplates)
+	config.ImageCodeTemplates = normalizeImageCodeTemplates(config.ImageCodeTemplates, config.FormatTemplates)
+	config.Shortcuts = normalizeShortcutConfig(config.Shortcuts)
+	config.ToolButtons = normalizeToolButtonConfigs(config.ToolButtons)
+	return config
+}
+
+func loadUserConfig() UserConfig {
+	config := defaultUserConfig()
+	path, err := userConfigPath()
+	if err != nil {
+		return config
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return config
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return defaultUserConfig()
+	}
+	return normalizeUserConfig(config)
+}
+
+func saveUserConfig(config UserConfig) error {
+	path, err := userConfigPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(normalizeUserConfig(config), "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func saveUserConfigSilently(config UserConfig) {
+	if err := saveUserConfig(config); err != nil {
+		log.Printf("保存配置失败: %v", err)
+	}
+}
+
+func newClickableTableRow(bg color.Color, content *fyne.Container, onTapped func()) *ClickableTableRow {
+	row := &ClickableTableRow{
+		background: canvas.NewRectangle(bg),
+		content:    content,
+		onTapped:   onTapped,
+	}
+	row.ExtendBaseWidget(row)
+	return row
+}
+
+type commitEntry struct {
+	widget.BaseWidget
+	Text        string
+	cursor      int
+	focused     bool
+	disabled    bool
+	onCommit    func(string)
+	OnSubmitted func(string)
+}
+
+type shortcutCaptureEntry struct {
+	widget.Entry
+	beforeCapture  string
+	capturing      bool
+	captureChanged bool
+}
+
+func newShortcutCaptureEntry() *shortcutCaptureEntry {
+	entry := &shortcutCaptureEntry{}
+	entry.ExtendBaseWidget(entry)
+	entry.SetPlaceHolder("点击后按组合键；Backspace/Delete 清空")
+	return entry
+}
+
+func (e *shortcutCaptureEntry) FocusGained() {
+	e.Entry.FocusGained()
+	if !e.capturing {
+		e.beforeCapture = e.Text
+		e.captureChanged = false
+		e.capturing = true
+		e.SetText("")
+	}
+	e.SetPlaceHolder("请按下组合快捷键；Backspace/Delete 清空")
+}
+
+func (e *shortcutCaptureEntry) FocusLost() {
+	if e.capturing && !e.captureChanged {
+		e.SetText(e.beforeCapture)
+	}
+	e.capturing = false
+	e.captureChanged = false
+	e.beforeCapture = ""
+	e.Entry.FocusLost()
+	e.SetPlaceHolder("点击后按组合键；Backspace/Delete 清空")
+}
+
+func (e *shortcutCaptureEntry) TypedKey(key *fyne.KeyEvent) {
+	switch key.Name {
+	case fyne.KeyBackspace, fyne.KeyDelete, fyne.KeyEscape:
+		e.captureChanged = true
+		e.SetText("")
+		return
+	default:
+		return
+	}
+}
+
+func (e *shortcutCaptureEntry) TypedRune(r rune) {
+	// 快捷键字段只接受真实按键事件，避免手动输入半截文本造成保存时格式错误。
+}
+
+func (e *shortcutCaptureEntry) TypedShortcut(shortcut fyne.Shortcut) {
+	keyboardShortcut, ok := shortcut.(fyne.KeyboardShortcut)
+	if !ok {
+		return
+	}
+	if text, ok := shortcutTextFromKeyboardShortcut(keyboardShortcut); ok {
+		e.captureChanged = true
+		e.SetText(text)
+	}
+}
+
+func newCommitEntry() *commitEntry {
+	entry := &commitEntry{}
+	entry.ExtendBaseWidget(entry)
+	return entry
+}
+
+func (e *commitEntry) SetText(text string) {
+	e.Text = text
+	if e.cursor > len([]rune(e.Text)) {
+		e.cursor = len([]rune(e.Text))
+	}
+	e.Refresh()
+}
+
+func (e *commitEntry) Enable() {
+	e.disabled = false
+	e.Refresh()
+}
+
+func (e *commitEntry) Disable() {
+	e.disabled = true
+	e.focused = false
+	e.Refresh()
+}
+
+func (e *commitEntry) Tapped(*fyne.PointEvent) {
+	if e.disabled {
+		return
+	}
+	canvas := fyne.CurrentApp().Driver().CanvasForObject(e)
+	if canvas != nil {
+		canvas.Focus(e)
+	}
+}
+
+func (e *commitEntry) FocusGained() {
+	if e.disabled {
+		return
+	}
+	e.focused = true
+	e.cursor = len([]rune(e.Text))
+	e.Refresh()
+}
+
+func (e *commitEntry) FocusLost() {
+	if !e.focused {
+		return
+	}
+	e.focused = false
+	if e.onCommit != nil {
+		e.onCommit(e.Text)
+	}
+	e.Refresh()
+}
+
+func (e *commitEntry) TypedRune(r rune) {
+	if e.disabled {
+		return
+	}
+
+	runes := []rune(e.Text)
+	if e.cursor < 0 || e.cursor > len(runes) {
+		e.cursor = len(runes)
+	}
+	runes = append(runes[:e.cursor], append([]rune{r}, runes[e.cursor:]...)...)
+	e.Text = string(runes)
+	e.cursor++
+	e.Refresh()
+}
+
+func (e *commitEntry) TypedKey(key *fyne.KeyEvent) {
+	if e.disabled {
+		return
+	}
+
+	runes := []rune(e.Text)
+	switch key.Name {
+	case fyne.KeyLeft:
+		if e.cursor > 0 {
+			e.cursor--
+		}
+	case fyne.KeyRight:
+		if e.cursor < len(runes) {
+			e.cursor++
+		}
+	case fyne.KeyHome:
+		e.cursor = 0
+	case fyne.KeyEnd:
+		e.cursor = len(runes)
+	case fyne.KeyBackspace:
+		if e.cursor > 0 {
+			runes = append(runes[:e.cursor-1], runes[e.cursor:]...)
+			e.cursor--
+			e.Text = string(runes)
+		}
+	case fyne.KeyDelete:
+		if e.cursor < len(runes) {
+			runes = append(runes[:e.cursor], runes[e.cursor+1:]...)
+			e.Text = string(runes)
+		}
+	case fyne.KeyReturn, fyne.KeyEnter:
+		e.focused = false
+		if e.OnSubmitted != nil {
+			e.OnSubmitted(e.Text)
+		}
+		canvas := fyne.CurrentApp().Driver().CanvasForObject(e)
+		if canvas != nil {
+			canvas.Unfocus()
+		}
+	}
+	e.Refresh()
+}
+
+func (e *commitEntry) TypedShortcut(shortcut fyne.Shortcut) {
+	if e.disabled {
+		return
+	}
+
+	switch s := shortcut.(type) {
+	case *fyne.ShortcutPaste:
+		if s.Clipboard != nil {
+			for _, r := range s.Clipboard.Content() {
+				e.TypedRune(r)
+			}
+		}
+	case *fyne.ShortcutCopy:
+		if s.Clipboard != nil {
+			s.Clipboard.SetContent(e.Text)
+		}
+	}
+}
+
+func (e *commitEntry) CreateRenderer() fyne.WidgetRenderer {
+	bg := canvas.NewRectangle(color.Transparent)
+	label := canvas.NewText("", getTextColor(isDarkTheme))
+	label.TextSize = 12
+	return &commitEntryRenderer{
+		entry:   e,
+		bg:      bg,
+		label:   label,
+		objects: []fyne.CanvasObject{bg, label},
+	}
+}
+
+type commitEntryRenderer struct {
+	entry   *commitEntry
+	bg      *canvas.Rectangle
+	label   *canvas.Text
+	objects []fyne.CanvasObject
+}
+
+func (r *commitEntryRenderer) Destroy() {}
+
+func (r *commitEntryRenderer) Layout(size fyne.Size) {
+	r.bg.Resize(size)
+	labelSize := r.label.MinSize()
+	r.label.Move(fyne.NewPos(6, (size.Height-labelSize.Height)/2))
+	r.label.Resize(fyne.NewSize(fyne.Max(0, size.Width-12), labelSize.Height))
+}
+
+func (r *commitEntryRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(58, 24)
+}
+
+func (r *commitEntryRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *commitEntryRenderer) Refresh() {
+	if r.entry.disabled {
+		r.bg.FillColor = transparent
+		r.label.Text = ""
+	} else {
+		if isDarkTheme {
+			r.bg.FillColor = color.NRGBA{55, 55, 55, 255}
+		} else {
+			r.bg.FillColor = color.NRGBA{220, 220, 220, 255}
+		}
+		r.label.Text = r.displayText()
+	}
+	r.label.Color = getTextColor(isDarkTheme)
+	r.bg.Refresh()
+	r.label.Refresh()
+}
+
+func (r *commitEntryRenderer) displayText() string {
+	if !r.entry.focused {
+		return r.entry.Text
+	}
+
+	runes := []rune(r.entry.Text)
+	cursor := r.entry.cursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+	runes = append(runes[:cursor], append([]rune{'|'}, runes[cursor:]...)...)
+	return string(runes)
+}
+
+func (r *ClickableTableRow) TappedSecondary(*fyne.PointEvent) {
+	// 右键点击，可以实现其他功能
+}
+
+func (r *ClickableTableRow) Tapped(*fyne.PointEvent) {
+	if r.onTapped != nil {
+		r.onTapped()
+	}
+}
+
+func (r *ClickableTableRow) DoubleTapped(*fyne.PointEvent) {
+	if r.onDoubleTap != nil {
+		r.onDoubleTap()
+	}
+}
+
+func (r *ClickableTableRow) CreateRenderer() fyne.WidgetRenderer {
+	r.background.SetMinSize(fyne.NewSize(250, 30))
+	return &clickableTableRowRenderer{
+		row:     r,
+		objects: []fyne.CanvasObject{r.background, r.content},
+	}
+}
+
+type clickableTableRowRenderer struct {
+	row     *ClickableTableRow
+	objects []fyne.CanvasObject
+}
+
+func (r *clickableTableRowRenderer) Destroy() {}
+
+func (r *clickableTableRowRenderer) Layout(size fyne.Size) {
+	r.row.background.Resize(size)
+	r.row.content.Resize(size)
+}
+
+func (r *clickableTableRowRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(250, 30)
+}
+
+func (r *clickableTableRowRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *clickableTableRowRenderer) Refresh() {
+	r.Layout(r.row.Size())
+}
+
+// 解析十六进制颜色字符串为RGBA颜色
+func hexToColor(hex string) color.Color {
+	hex = strings.TrimPrefix(hex, "#")
+	if len(hex) != 6 {
+		return color.RGBA{100, 100, 255, 255} // 默认蓝色
+	}
+
+	r, _ := strconv.ParseUint(hex[0:2], 16, 8)
+	g, _ := strconv.ParseUint(hex[2:4], 16, 8)
+	b, _ := strconv.ParseUint(hex[4:6], 16, 8)
+
+	return color.RGBA{uint8(r), uint8(g), uint8(b), 255}
+}
+
+// 带动画的截图按钮
+type AnimatedScreenshotButton struct {
+	widget.BaseWidget
+	button        *widget.Button
+	animationView *canvas.Raster
+	isLoading     bool
+	scale         float32
+	scaleDir      float32 // 1 为放大, -1 为缩小
+	animationStop chan bool
+	onTapped      func()
+}
+
+func NewAnimatedScreenshotButton(text string, icon fyne.Resource, tapped func()) *AnimatedScreenshotButton {
+	btn := &AnimatedScreenshotButton{
+		scale:    0.5,
+		scaleDir: 1.0,
+		onTapped: tapped,
+	}
+	btn.button = widget.NewButtonWithIcon(text, icon, func() {
+		if !btn.isLoading {
+			tapped()
+		}
+	})
+	btn.button.Importance = widget.MediumImportance
+
+	// 创建动画视图
+	btn.animationView = canvas.NewRaster(btn.drawAnimation)
+	btn.animationView.SetMinSize(fyne.NewSize(20, 20))
+	btn.animationView.Hide()
+
+	btn.ExtendBaseWidget(btn)
+	return btn
+}
+
+// 绘制动画圆圈
+func (b *AnimatedScreenshotButton) drawAnimation(w, h int) image.Image {
+	if !b.isLoading || w == 0 || h == 0 {
+		return image.NewRGBA(image.Rect(0, 0, w, h))
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+
+	// 圆圈中心位置
+	centerX := w / 2
+	centerY := h / 2
+	baseRadius := 6.0
+	radius := baseRadius * float64(b.scale)
+
+	// 绘制填充的圆
+	fillColor := color.NRGBA{66, 150, 255, 200}
+	strokeColor := color.NRGBA{66, 150, 255, 255}
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dx := float64(x - centerX)
+			dy := float64(y - centerY)
+			dist := math.Sqrt(dx*dx + dy*dy)
+
+			if dist <= radius {
+				img.Set(x, y, fillColor)
+			} else if dist <= radius+1.5 {
+				// 描边
+				img.Set(x, y, strokeColor)
+			}
+		}
+	}
+
+	return img
+}
+
+func (b *AnimatedScreenshotButton) StartLoading() {
+	if b.isLoading {
+		return
+	}
+	b.isLoading = true
+	b.button.Disable()
+	b.scale = 0.5
+	b.scaleDir = 1.0
+	b.animationView.Show()
+	b.animationStop = make(chan bool)
+
+	// 启动动画
+	go func() {
+		ticker := time.NewTicker(16 * time.Millisecond) // 约60fps，更流畅
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-b.animationStop:
+				return
+			case <-ticker.C:
+				// 更新缩放 - 从0.5到1.5之间缩放，速度更快
+				b.scale += b.scaleDir * 0.15
+				if b.scale >= 1.6 {
+					b.scale = 1.6
+					b.scaleDir = -1.0
+				} else if b.scale <= 0.4 {
+					b.scale = 0.4
+					b.scaleDir = 1.0
+				}
+
+				// 使用fyne.Do确保在主线程中刷新UI
+				fyne.Do(func() {
+					b.animationView.Refresh()
+				})
+			}
+		}
+	}()
+}
+
+func (b *AnimatedScreenshotButton) StopLoading() {
+	if !b.isLoading {
+		return
+	}
+	b.isLoading = false
+
+	if b.animationStop != nil {
+		close(b.animationStop)
+		b.animationStop = nil
+	}
+
+	// 使用fyne.Do确保在主线程中更新UI
+	fyne.Do(func() {
+		b.button.Enable()
+		b.scale = 0.5
+		b.scaleDir = 1.0
+		b.animationView.Hide()
+		b.Refresh()
+	})
+}
+
+func (b *AnimatedScreenshotButton) IsLoading() bool {
+	return b.isLoading
+}
+
+func (b *AnimatedScreenshotButton) CreateRenderer() fyne.WidgetRenderer {
+	return &animatedScreenshotButtonRenderer{
+		button:        b,
+		buttonWidget:  b.button,
+		animationView: b.animationView,
+		objects:       []fyne.CanvasObject{b.button, b.animationView},
+	}
+}
+
+type animatedScreenshotButtonRenderer struct {
+	button        *AnimatedScreenshotButton
+	buttonWidget  *widget.Button
+	animationView *canvas.Raster
+	objects       []fyne.CanvasObject
+}
+
+func (r *animatedScreenshotButtonRenderer) Layout(size fyne.Size) {
+	r.buttonWidget.Resize(size)
+
+	// 动画圆圈位置：在按钮右侧
+	animSize := float32(20)
+	animX := size.Width - animSize - 8
+	animY := (size.Height - animSize) / 2
+
+	r.animationView.Move(fyne.NewPos(animX, animY))
+	r.animationView.Resize(fyne.NewSize(animSize, animSize))
+}
+
+func (r *animatedScreenshotButtonRenderer) MinSize() fyne.Size {
+	return r.buttonWidget.MinSize()
+}
+
+func (r *animatedScreenshotButtonRenderer) Refresh() {
+	r.buttonWidget.Refresh()
+	r.animationView.Refresh()
+	r.Layout(r.button.Size())
+}
+
+func (r *animatedScreenshotButtonRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *animatedScreenshotButtonRenderer) Destroy() {
+	if r.button.animationStop != nil {
+		close(r.button.animationStop)
+	}
+}
+
+// 完全自定义的颜色复选框
+type ColorCheck struct {
+	widget.BaseWidget
+	Checked   bool
+	OnChanged func(bool)
+	Color     color.Color
+}
+
+// 创建新的彩色复选框
+func NewColorCheck(checked bool, fillColor color.Color, changed func(bool)) *ColorCheck {
+	check := &ColorCheck{
+		Checked:   checked,
+		OnChanged: changed,
+		Color:     fillColor,
+	}
+	check.ExtendBaseWidget(check)
+	return check
+}
+
+// 处理点击事件
+func (c *ColorCheck) Tapped(*fyne.PointEvent) {
+	c.Checked = !c.Checked
+	if c.OnChanged != nil {
+		c.OnChanged(c.Checked)
+	}
+	c.Refresh()
+}
+
+// 鼠标进入时显示指针
+func (c *ColorCheck) MouseIn(*desktop.MouseEvent) {
+	c.Refresh()
+}
+
+// 鼠标离开时恢复
+func (c *ColorCheck) MouseOut() {
+	c.Refresh()
+}
+
+// 实现桌面鼠标悬停接口
+func (c *ColorCheck) MouseMoved(*desktop.MouseEvent) {}
+func (c *ColorCheck) CursorType() desktop.Cursor {
+	return desktop.PointerCursor
+}
+
+// 创建渲染器
+func (c *ColorCheck) CreateRenderer() fyne.WidgetRenderer {
+	// 创建绘制组件
+	box := canvas.NewRectangle(color.NRGBA{0, 0, 0, 0})
+	box.StrokeWidth = 1                               // 边框保持1像素
+	box.StrokeColor = color.NRGBA{160, 160, 160, 200} // 使用灰色边框，不那么刺眼
+
+	// 创建选中标记 - 使用两条线组成勾号
+	// 勾的颜色根据背景色而定，初始化时可以先用白色，Refresh时会更新
+	checkLine1 := canvas.NewLine(color.White)
+	checkLine1.StrokeWidth = 2 // 回到标准线宽
+
+	checkLine2 := canvas.NewLine(color.White)
+	checkLine2.StrokeWidth = 2 // 回到标准线宽
+
+	renderer := &colorCheckRenderer{
+		check:      c,
+		box:        box,
+		checkLine1: checkLine1,
+		checkLine2: checkLine2,
+		objects:    []fyne.CanvasObject{box, checkLine1, checkLine2},
+	}
+
+	// 如果已经选中，立即设置正确的对比色
+	if c.Checked {
+		contrastColor := getContrastColor(c.Color)
+		checkLine1.StrokeColor = contrastColor
+		checkLine2.StrokeColor = contrastColor
+	}
+
+	return renderer
+}
+
+// 自定义渲染器
+type colorCheckRenderer struct {
+	check      *ColorCheck
+	box        *canvas.Rectangle
+	checkLine1 *canvas.Line
+	checkLine2 *canvas.Line
+	objects    []fyne.CanvasObject
+}
+
+func (r *colorCheckRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(16, 16) // 从18x18减小到16x16
+}
+
+func (r *colorCheckRenderer) Layout(size fyne.Size) {
+	// 计算复选框的尺寸和位置
+	boxSize := fyne.Min(size.Width, size.Height)
+	r.box.Resize(fyne.NewSize(boxSize, boxSize))
+	r.box.Move(fyne.NewPos(0, (size.Height-boxSize)/2))
+
+	// 调整勾选图标位置，使其在复选框中更加居中
+	// 整体向右下方移动一些
+
+	// 第一条线 - 从左往右稍微向下倾斜
+	r.checkLine1.Position1 = fyne.NewPos(boxSize*0.25, boxSize*0.5)  // 右移并下移起点
+	r.checkLine1.Position2 = fyne.NewPos(boxSize*0.45, boxSize*0.65) // 右移并下移终点
+
+	// 第二条线 - 从中间向右上方延伸
+	r.checkLine2.Position1 = fyne.NewPos(boxSize*0.45, boxSize*0.65) // 与第一条线终点一致
+	r.checkLine2.Position2 = fyne.NewPos(boxSize*0.8, boxSize*0.35)  // 右移并下移终点
+}
+
+func (r *colorCheckRenderer) Refresh() {
+	if r.check.Checked {
+		// 如果选中，使用指定的颜色填充，边框设为0使其不可见
+		r.box.FillColor = r.check.Color
+		r.box.StrokeWidth = 0 // 选中时不显示边框
+		r.checkLine1.Hidden = false
+		r.checkLine2.Hidden = false
+
+		// 根据背景色亮度决定勾的颜色
+		contrastColor := getContrastColor(r.check.Color)
+		r.checkLine1.StrokeColor = contrastColor
+		r.checkLine2.StrokeColor = contrastColor
+	} else {
+		// 如果未选中，使用透明填充，恢复边框
+		r.box.FillColor = color.NRGBA{0, 0, 0, 0}
+		r.box.StrokeWidth = 1                               // 未选中时显示边框
+		r.box.StrokeColor = color.NRGBA{160, 160, 160, 200} // 确保未选中时边框是灰色
+		r.checkLine1.Hidden = true
+		r.checkLine2.Hidden = true
+	}
+
+	r.box.Refresh()
+	r.checkLine1.Refresh()
+	r.checkLine2.Refresh()
+}
+
+func (r *colorCheckRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *colorCheckRenderer) Destroy() {}
+
+func adbDeviceFingerprint(deviceID string) string {
+	output, err := adbExecCombined("-s", deviceID, "shell", "settings", "get", "secure", "android_id")
+	if err != nil {
+		return ""
+	}
+
+	fingerprint := strings.TrimSpace(output)
+	if fingerprint == "" || strings.EqualFold(fingerprint, "null") {
+		return ""
+	}
+	return fingerprint
+}
+
+func uniqueADBDeviceIDs(deviceIDs []string) []string {
+	unique := make([]string, 0, len(deviceIDs))
+	seen := make(map[string]struct{}, len(deviceIDs))
+
+	for _, deviceID := range deviceIDs {
+		key := deviceID
+		if strings.Contains(deviceID, ":") {
+			if fingerprint := adbDeviceFingerprint(deviceID); fingerprint != "" {
+				key = "android_id:" + fingerprint
+			}
+		}
+		if _, exists := seen[key]; exists {
+			log.Printf("[device] 跳过重复 ADB 地址: id=%s key=%s", deviceID, key)
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, deviceID)
+	}
+	return unique
+}
+
+// 获取所有连接的ADB设备（包括虚拟屏）
+func getADBDevices() ([]string, error) {
+	log.Printf("[device] 开始获取设备列表，adb=%q", adb)
+
+	// 解析输出
+	devicesOutput, err := adbExecCombined("devices")
+	if err != nil {
+		log.Printf("[device] adb devices 失败: err=%v output=%q", err, logPreview(devicesOutput, 1000))
+		return nil, fmt.Errorf("adb devices 失败: %v", adbErrorWithOutput(err, devicesOutput))
+	}
+	log.Printf("[device] adb devices 输出: %q", logPreview(devicesOutput, 1000))
+
+	lines := strings.Split(devicesOutput, "\n")
+	var baseDevices []string
+
+	// 跳过第一行（标题行）
+	for i := 1; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "offline") {
+			log.Printf("[device] 跳过 offline 设备行: %q", line)
+			continue
+		}
+
+		// 设备ID在每行的开始
+		parts := strings.Fields(line)
+		if len(parts) >= 1 && parts[0] != "" {
+			deviceID := parts[0]
+			baseDevices = append(baseDevices, deviceID)
+			if len(parts) >= 2 {
+				log.Printf("[device] 发现设备: id=%s state=%s raw=%q", deviceID, parts[1], line)
+			} else {
+				log.Printf("[device] 发现设备: id=%s raw=%q", deviceID, line)
+			}
+		}
+	}
+	if len(baseDevices) == 0 {
+		targets := discoverEmulatorADBTargets()
+		if len(targets) > 0 {
+			log.Printf("[device] 未发现 ADB 设备，开始探测模拟器端口: %v", targets)
+			for _, target := range targets {
+				connectOutput, connectErr := adbExecCombined("connect", target)
+				if connectErr != nil {
+					log.Printf("[device] 模拟器 ADB 连接失败: target=%s err=%v output=%q", target, connectErr, logPreview(connectOutput, 300))
+					continue
+				}
+				log.Printf("[device] 模拟器 ADB 连接结果: target=%s output=%q", target, logPreview(connectOutput, 300))
+			}
+
+			devicesOutput, err = adbExecCombined("devices")
+			if err != nil {
+				log.Printf("[device] 模拟器端口探测后 adb devices 失败: err=%v output=%q", err, logPreview(devicesOutput, 1000))
+				return nil, fmt.Errorf("adb devices 失败: %v", adbErrorWithOutput(err, devicesOutput))
+			}
+			log.Printf("[device] 模拟器端口探测后 adb devices 输出: %q", logPreview(devicesOutput, 1000))
+
+			lines = strings.Split(devicesOutput, "\n")
+			baseDevices = nil
+			for i := 1; i < len(lines); i++ {
+				line := strings.TrimSpace(lines[i])
+				if line == "" {
+					continue
+				}
+				if strings.Contains(strings.ToLower(line), "offline") {
+					log.Printf("[device] 跳过 offline 设备行: %q", line)
+					continue
+				}
+
+				parts := strings.Fields(line)
+				if len(parts) >= 1 && parts[0] != "" {
+					baseDevices = append(baseDevices, parts[0])
+				}
+			}
+		}
+	}
+	baseDevices = uniqueADBDeviceIDs(baseDevices)
+	log.Printf("[device] 基础设备数量: %d", len(baseDevices))
+
+	// 构建最终设备列表（包含虚拟屏）
+	var devices []string
+
+	for _, deviceID := range baseDevices {
+		// 确保 cap.dex 已推送到设备（仅对基础设备，首次出现时推送）
+		ensureCapDexOnDevice(deviceID)
+
+		// 先添加原始设备
+		devices = append(devices, deviceID)
+
+		// 尝试获取虚拟屏ID
+		virtualDisplays := getVirtualDisplays(deviceID)
+		log.Printf("[device] 设备 %s 虚拟屏: %v", deviceID, virtualDisplays)
+		for _, displayID := range virtualDisplays {
+			// 添加虚拟屏格式：设备ID[虚拟屏ID]
+			devices = append(devices, fmt.Sprintf("%s[%s]", deviceID, displayID))
+		}
+	}
+
+	log.Printf("[device] 最终设备列表: %v", devices)
+	return devices, nil
+}
+
+// 获取设备的虚拟屏ID列表
+func getVirtualDisplays(deviceID string) []string {
+	args := append([]string{"-s", deviceID}, androidCapDexMainArgs("1")...)
+	output, err := adbExecCombined(args...)
+	if err != nil {
+		log.Printf("[device] 获取虚拟屏失败: device=%s err=%v", deviceID, adbErrorWithOutput(err, output))
+	} else {
+		log.Printf("[device] 获取虚拟屏输出: device=%s output=%q", deviceID, logPreview(output, 500))
+	}
+
+	displayIDs := parseVirtualDisplayIDs(output)
+	if len(displayIDs) > 0 {
+		return displayIDs
+	}
+
+	fallbackIDs := getVirtualDisplaysFromDumpsys(deviceID)
+	if len(fallbackIDs) > 0 {
+		log.Printf("[device] 通过 dumpsys display 发现虚拟屏: device=%s displays=%v", deviceID, fallbackIDs)
+		return fallbackIDs
+	}
+
+	log.Printf("[device] 设备 %s 无可用虚拟屏或获取失败", deviceID)
+	return nil
+}
+
+func getVirtualDisplaysFromDumpsys(deviceID string) []string {
+	output, err := adbExecCombined("-s", deviceID, "shell", "dumpsys", "display")
+	if err != nil {
+		log.Printf("[device] dumpsys display 获取虚拟屏失败: device=%s err=%v", deviceID, adbErrorWithOutput(err, output))
+		return nil
+	}
+	return parseDumpsysVirtualDisplayIDs(output)
+}
+
+func parseVirtualDisplayIDs(output string) []string {
+	var displayIDs []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(output, "\n") {
+		addVirtualDisplayID(&displayIDs, seen, strings.TrimSpace(line))
+	}
+	return displayIDs
+}
+
+func parseDumpsysVirtualDisplayIDs(output string) []string {
+	var displayIDs []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(output, "\n") {
+		idx := strings.Index(line, "mDisplayId=")
+		if idx == -1 {
+			continue
+		}
+
+		start := idx + len("mDisplayId=")
+		end := start
+		for end < len(line) && line[end] >= '0' && line[end] <= '9' {
+			end++
+		}
+		addVirtualDisplayID(&displayIDs, seen, line[start:end])
+	}
+	return displayIDs
+}
+
+func addVirtualDisplayID(displayIDs *[]string, seen map[string]struct{}, displayID string) {
+	displayID = strings.TrimSpace(displayID)
+	if displayID == "" || displayID == "0" || !isNumeric(displayID) {
+		return
+	}
+	if _, ok := seen[displayID]; ok {
+		return
+	}
+	seen[displayID] = struct{}{}
+	*displayIDs = append(*displayIDs, displayID)
+}
+
+func buildDeviceDisplayOptions(devices []string) ([]string, map[string][]string) {
+	baseDevices := make([]string, 0, len(devices))
+	displayOptions := make(map[string][]string)
+	seenBase := make(map[string]struct{})
+	seenDisplays := make(map[string]map[string]struct{})
+
+	for _, deviceID := range devices {
+		baseDevice, displayID := splitAndroidDeviceID(deviceID)
+		if baseDevice == "" {
+			continue
+		}
+
+		if _, ok := seenBase[baseDevice]; !ok {
+			seenBase[baseDevice] = struct{}{}
+			baseDevices = append(baseDevices, baseDevice)
+			displayOptions[baseDevice] = []string{"0"}
+			seenDisplays[baseDevice] = map[string]struct{}{"0": {}}
+		}
+
+		if displayID == "" {
+			continue
+		}
+		if _, ok := seenDisplays[baseDevice][displayID]; ok {
+			continue
+		}
+		seenDisplays[baseDevice][displayID] = struct{}{}
+		displayOptions[baseDevice] = append(displayOptions[baseDevice], displayID)
+	}
+
+	return baseDevices, displayOptions
+}
+
+func normalizeDisplayOptions(options []string) []string {
+	if len(options) == 0 {
+		return []string{"0"}
+	}
+	return options
+}
+
+func selectOptionsWithPrompt(prompt string, options []string) []string {
+	result := make([]string, 0, len(options)+1)
+	result = append(result, prompt)
+	result = append(result, options...)
+	return result
+}
+
+func containsString(items []string, value string) bool {
+	for _, item := range items {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func formatAndroidDeviceID(baseDevice, displayID string) string {
+	baseDevice = strings.TrimSpace(baseDevice)
+	displayID = strings.TrimSpace(displayID)
+	if baseDevice == "" {
+		return ""
+	}
+	if displayID == "" || displayID == "0" {
+		return baseDevice
+	}
+	return fmt.Sprintf("%s[%s]", baseDevice, displayID)
+}
+
+func selectedAndroidDeviceID() string {
+	return formatAndroidDeviceID(selectedDevice, selectedDisplayID)
+}
+
+// 检查字符串是否为纯数字
+func isNumeric(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+func captureScreenWithADB(deviceID string) (img image.Image, err error) {
+	baseDeviceID, virtualDisplayID := splitAndroidDeviceID(deviceID)
+	if baseDeviceID == "" {
+		return nil, fmt.Errorf("设备 ID 为空")
+	}
+
+	localTempFile, err := ioutil.TempFile("", "screenshot_*.png")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时文件失败: %v", err)
+	}
+	localTempPath := localTempFile.Name()
+	if closeErr := localTempFile.Close(); closeErr != nil {
+		return nil, fmt.Errorf("关闭临时文件失败: %v", closeErr)
+	}
+
+	// 确保清理本地临时文件
+	defer os.Remove(localTempPath)
+
+	var failed []string
+	for _, deviceTempPath := range androidScreenshotTempPaths() {
+		if captureErr := captureScreenToDevicePath(baseDeviceID, virtualDisplayID, deviceTempPath); captureErr != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", deviceTempPath, captureErr))
+			continue
+		}
+
+		output, execErr := adbExecCombined("-s", baseDeviceID, "pull", deviceTempPath, localTempPath)
+		_, _ = adbExecCombined("-s", baseDeviceID, "shell", "rm", deviceTempPath)
+		if execErr != nil {
+			failed = append(failed, fmt.Sprintf("%s: 拉取截图失败: %v", deviceTempPath, adbErrorWithOutput(execErr, output)))
+			continue
+		}
+
+		data, readErr := ioutil.ReadFile(localTempPath)
+		if readErr != nil {
+			return nil, fmt.Errorf("读取临时文件失败: %v", readErr)
+		}
+
+		// 解码图片
+		return png.Decode(bytes.NewReader(data))
+	}
+
+	if len(failed) == 0 {
+		return nil, fmt.Errorf("截图失败")
+	}
+	return nil, fmt.Errorf("截图失败，已尝试临时路径: %s", strings.Join(failed, "; "))
+}
+
+func androidScreenshotTempPaths() []string {
+	return []string{
+		"/data/local/tmp/screenshot_temp.png",
+		"/sdcard/screenshot_temp.png",
+	}
+}
+
+func captureScreenToDevicePath(baseDeviceID, virtualDisplayID, deviceTempPath string) error {
+	// 根据是否有虚拟屏ID选择截图方式
+	if virtualDisplayID != "" {
+		ensureCapDexOnDevice(baseDeviceID)
+		args := append([]string{"-s", baseDeviceID}, androidCapDexMainArgs("2", virtualDisplayID, deviceTempPath)...)
+		output, execErr := adbExecCombined(args...)
+		if execErr != nil {
+			return fmt.Errorf("虚拟屏截图失败: %v", adbErrorWithOutput(execErr, output))
+		}
+		return nil
+	}
+
+	output, execErr := adbExecCombined("-s", baseDeviceID, "shell", "screencap", deviceTempPath)
+	if execErr != nil {
+		return fmt.Errorf("截图失败: %v", adbErrorWithOutput(execErr, output))
+	}
+	return nil
+}
+
+// 设备监控线程
+func deviceMonitor() {
+	for {
+		updateDeviceList()
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// 更新设备列表
+func updateDeviceList() {
+	if deviceSelect == nil || displaySelect == nil {
+		return
+	}
+	if screenshotSourceIsRemote() {
+		return
+	}
+
+	currentSelectedDevice := strings.TrimSpace(deviceSelect.Selected)
+	if currentSelectedDevice == deviceSelectPrompt {
+		currentSelectedDevice = strings.TrimSpace(selectedDevice)
+	}
+	currentSelectedDisplay := strings.TrimSpace(displaySelect.Selected)
+	if currentSelectedDisplay == displaySelectPrompt {
+		currentSelectedDisplay = strings.TrimSpace(selectedDisplayID)
+	}
+	if currentSelectedDisplay == "" {
+		currentSelectedDisplay = "0"
+	}
+	currentDeviceOptions := append([]string(nil), deviceSelect.Options...)
+	currentDisplayOptions := append([]string(nil), displaySelect.Options...)
+
+	// 获取新设备列表
+	devices, err := getADBDevices()
+	if err != nil {
+		log.Printf("[device] 更新设备列表失败: %v", err)
+		// 错误处理
+		fyne.Do(func() {
+			// 先清空选项列表和选择
+			deviceSelect.Options = []string{deviceSelectPrompt}
+			deviceSelect.Selected = "" // 直接设置 Selected 字段
+			deviceSelect.SetSelected("")
+			displaySelect.Options = selectOptionsWithPrompt(displaySelectPrompt, []string{"0"})
+			displaySelect.SetSelected("0")
+			deviceDisplayOptions = map[string][]string{}
+			selectedDevice = ""
+			selectedDisplayID = "0"
+			if appLoggingEnabled {
+				deviceSelect.PlaceHolder = "获取设备失败（见日志）"
+			} else {
+				deviceSelect.PlaceHolder = "获取设备失败（可开启日志）"
+			}
+			displaySelect.PlaceHolder = displaySelectPrompt
+			deviceSelect.Refresh()
+			displaySelect.Refresh()
+		})
+		return
+	}
+
+	baseDevices, displayOptionsByDevice := buildDeviceDisplayOptions(devices)
+
+	// 无设备情况处理
+	if len(baseDevices) == 0 {
+		log.Printf("[device] 未发现已连接设备")
+		fyne.Do(func() {
+			// 先清空选项列表和选择
+			deviceSelect.Options = []string{deviceSelectPrompt}
+			deviceSelect.Selected = "" // 直接设置 Selected 字段
+			deviceSelect.SetSelected("")
+			displaySelect.Options = selectOptionsWithPrompt(displaySelectPrompt, []string{"0"})
+			displaySelect.SetSelected("0")
+			deviceSelect.PlaceHolder = "无设备连接"
+			displaySelect.PlaceHolder = displaySelectPrompt
+			deviceDisplayOptions = map[string][]string{}
+			selectedDevice = ""
+			selectedDisplayID = "0"
+			deviceSelect.Refresh()
+			displaySelect.Refresh()
+		})
+		return
+	}
+
+	targetDevice := currentSelectedDevice
+	if targetDevice == "" || !containsString(baseDevices, targetDevice) {
+		targetDevice = baseDevices[0]
+	}
+
+	displayOptions := normalizeDisplayOptions(displayOptionsByDevice[targetDevice])
+	targetDisplay := currentSelectedDisplay
+	if !containsString(displayOptions, targetDisplay) {
+		targetDisplay = "0"
+	}
+	deviceUIOptions := selectOptionsWithPrompt(deviceSelectPrompt, baseDevices)
+	displayUIOptions := selectOptionsWithPrompt(displaySelectPrompt, displayOptions)
+
+	// 只有当列表变化或需要更新选择时才更新UI
+	if !stringSlicesEqual(deviceUIOptions, currentDeviceOptions) ||
+		!stringSlicesEqual(displayUIOptions, currentDisplayOptions) ||
+		currentSelectedDevice != targetDevice ||
+		currentSelectedDisplay != targetDisplay {
+		log.Printf("[device] 更新下拉设备列表: devices=%v displays=%v current=%q[%s] target=%q[%s]", baseDevices, displayOptionsByDevice, currentSelectedDevice, currentSelectedDisplay, targetDevice, targetDisplay)
+		fyne.Do(func() {
+			// 更新设备列表
+			deviceDisplayOptions = displayOptionsByDevice
+			deviceSelect.Options = deviceUIOptions
+			displaySelect.Options = displayUIOptions
+			deviceSelect.SetSelected(targetDevice)
+			displaySelect.SetSelected(targetDisplay)
+			deviceSelect.PlaceHolder = deviceSelectPrompt
+			displaySelect.PlaceHolder = displaySelectPrompt
+			selectedDevice = targetDevice
+			selectedDisplayID = targetDisplay
+			deviceSelect.Refresh()
+			displaySelect.Refresh()
+		})
+	} else {
+		fyne.Do(func() {
+			deviceDisplayOptions = displayOptionsByDevice
+		})
+	}
+}
+
+// 定义点标记结构体
+type MarkPoint struct {
+	X, Y  int
+	Color color.Color
+}
+
+// 定义矩形标记结构体
+type MarkRect struct {
+	X1, Y1 int // 起点
+	X2, Y2 int // 终点
+	Color  color.Color
+}
+
+type imageDragMode int
+
+const (
+	imageDragNone imageDragMode = iota
+	imageDragPan
+	imageDragRange
+	imageDragPoint
+)
+
+const (
+	minImageZoom                      float32 = 0.1
+	maxImageZoom                      float32 = 8
+	zoomStepMultiplier                float32 = 1.1
+	imageViewerMaxZoom                float32 = 2.0
+	zoomLevelStep                     float32 = 0.2
+	maxRightMenuPoints                        = 20
+	colorPointTableVisibleRows                = 20
+	colorPointTableDefaultVisibleRows         = 12
+	colorPointTableRowHeight          float32 = 30
+	colorPointTableHeaderHeight       float32 = 28
+	defaultRangeText                          = "0,0,0,0"
+	findTestMarkRadius                        = 10
+	linkedPointHitRadius                      = 12
+	linkedPointMarkRadius                     = 14
+	linkedPointFlashCount                     = 10
+	linkedPointFlashInterval                  = 140 * time.Millisecond
+	linkedPointHoldAfterFlash                 = 3 * time.Second
+)
+
+// 自定义图像查看器，支持显示图像和鼠标事件跟踪
+type ImageViewer struct {
+	widget.BaseWidget
+	image              image.Image // 当前显示的图像
+	originalImage      image.Image // 保存的原始图像
+	rotationDegrees    int         // 当前旋转角度 (0, 90, 180, 270)
+	zoomScale          float32     // 当前缩放倍率
+	displayImage       *canvas.Image
+	contextMenu        fyne.CanvasObject
+	markPoints         []MarkPoint // 存储点标记
+	markRects          []MarkRect  // 存储矩形标记
+	findTestRects      []MarkRect  // 存储找色测试结果高亮框
+	linkedPointRects   []MarkRect  // 存储图像点和列表联动高亮框
+	nodeOverlayRects   []MarkRect  // 存储节点工具全部节点框
+	nodeSelectedRects  []MarkRect  // 存储节点工具当前选中节点框
+	mouseDownX         int         // 鼠标按下时的X坐标
+	mouseDownY         int         // 鼠标按下时的Y坐标
+	isDragging         bool        // 是否正在拖动
+	dragMode           imageDragMode
+	lastDragAbs        fyne.Position
+	tempRect           *MarkRect // 临时矩形，用于拖动过程的显示
+	lastMouseX         int       // 上次鼠标X坐标（用于检测真实移动）
+	lastMouseY         int       // 上次鼠标Y坐标（用于检测真实移动）
+	onMouseMove        func(x, y int)
+	onMouseDown        func(x, y int)
+	onMouseUp          func(x, y int)
+	onRightClick       func(x, y int)
+	onRangeModeChanged func(enabled bool)
+	onRangeSelected    func(rect image.Rectangle)
+	onActivated        func()
+	getGridParams      func() (cols, rows, spacing int, hasParams bool) // 获取点阵参数的回调
+	scrollContainer    *imageScrollContainer                            // 滚动容器引用
+	magnifier          *MagnifierWidget                                 // 放大镜引用
+	ctrlHeld           bool                                             // 当前查看器是否收到 Ctrl 按下状态
+	manualRectSelected bool                                             // 是否手动框选了区域
+	rangeSelectMode    bool                                             // 是否等待框选范围
+	mouseInWidget      bool                                             // 鼠标是否在图片框上
+	nodeToolOnly       bool                                             // 节点工具专用页不响应图色工具操作
+	window             fyne.Window                                      // 窗口引用，用于获取窗口位置
+}
+
+// imageScrollContainer 统一处理图像区域的滚轮事件。
+// 图像区域不使用滚轮平移，普通滚轮直接忽略；平移统一使用鼠标左键拖动。
+// 这样 Ctrl+滚轮 只会缩放，不会再触发上下滚动。
+type imageScrollContainer struct {
+	*container.Scroll
+	viewer *ImageViewer
+}
+
+func newImageScrollContainer(content fyne.CanvasObject, viewer *ImageViewer) *imageScrollContainer {
+	return &imageScrollContainer{
+		Scroll: container.NewScroll(content),
+		viewer: viewer,
+	}
+}
+
+func (s *imageScrollContainer) Scrolled(e *fyne.ScrollEvent) {
+	if s.viewer == nil || e == nil {
+		s.Scroll.Scrolled(e)
+		return
+	}
+
+	ctrlHeld := s.viewer.ctrlHeld
+	if driver, ok := fyne.CurrentApp().Driver().(desktop.Driver); ok {
+		ctrlHeld = ctrlHeld || driver.CurrentKeyModifiers()&fyne.KeyModifierControl != 0
+	}
+	if !ctrlHeld {
+		// 普通滚轮不平移图像，避免滚轮和 Ctrl+滚轮走两套状态。
+		return
+	}
+
+	delta := e.Scrolled.DY
+	if delta == 0 {
+		delta = e.Scrolled.DX
+	}
+	if delta == 0 {
+		return
+	}
+
+	// ScrollEvent.Position 相对于滚动视口，转换为 ImageViewer 的内容坐标。
+	viewerPos := e.Position.Add(s.Offset).Subtract(s.viewer.Position())
+	s.viewer.zoomAt(viewerPos, delta > 0)
+}
+
+// 全局颜色点列表，供右侧表格使用
+var colorPoints []ColorPoint
+
+// 全局标签页数据映射：tabItem -> TabData
+var tabDataMap = make(map[*container.TabItem]*TabData)
+
+// 当前活动的标签页
+var currentTab *container.TabItem
+
+// 全局刷新表格函数，会在main中设置
+var refreshColorList func()
+
+// 全局触发生成代码函数，会在main中设置
+var triggerGenerateCode func()
+
+// 获取找色模式，返回"多点找色"或"多点比色"
+func getColorMode() string {
+	if colorModeRadio == nil {
+		return "找色" // 默认模式
+	}
+
+	selected := colorModeRadio.Selected
+	if selected == "" {
+		return "找色" // 未选择时返回默认模式
+	}
+
+	return selected
+}
+
+// 保存当前标签页的数据
+func saveCurrentTabData() {
+	if currentTab == nil || imageViewer == nil {
+		return
+	}
+	if imageViewer.nodeToolOnly {
+		return
+	}
+
+	tabData, exists := tabDataMap[currentTab]
+	if !exists {
+		tabData = &TabData{}
+		tabDataMap[currentTab] = tabData
+	}
+
+	// 保存颜色点列表（深拷贝）
+	tabData.colorPoints = make([]ColorPoint, len(colorPoints))
+	copy(tabData.colorPoints, colorPoints)
+
+	// 保存矩形标记数据（深拷贝）
+	tabData.markRects = make([]MarkRect, len(imageViewer.markRects))
+	copy(tabData.markRects, imageViewer.markRects)
+	tabData.manualRectSelected = imageViewer.manualRectSelected
+
+	// 保存生成的代码
+	if codeDisplayEntry != nil {
+		tabData.generatedCode = codeDisplayEntry.Text
+	}
+
+	// 保存图像查看器引用
+	tabData.imageViewer = imageViewer
+}
+
+// 恢复标签页数据
+func restoreTabData(tab *container.TabItem) {
+	clearLinkedColorPointVisual()
+
+	tabData, exists := tabDataMap[tab]
+	if !exists || tabData.imageViewer == nil {
+		// 如果是欢迎页或没有数据，清空
+		colorPoints = make([]ColorPoint, 0)
+		imageViewer = nil
+		setRectCoordText(defaultRangeText)
+		if codeDisplayEntry != nil {
+			codeDisplayEntry.SetText("")
+		}
+		if refreshColorList != nil {
+			refreshColorList()
+		}
+		return
+	}
+
+	if tabData.nodeToolOnly {
+		if selectNodeToolTab != nil {
+			selectNodeToolTab()
+		}
+		colorPoints = make([]ColorPoint, 0)
+		imageViewer = nil
+		setRectCoordText(defaultRangeText)
+		if codeDisplayEntry != nil {
+			codeDisplayEntry.SetText("")
+		}
+		if refreshColorList != nil {
+			refreshColorList()
+		}
+		if tabData.imageViewer != nil {
+			if tabData.imageViewer.image != nil {
+				tabData.imageViewer.Refresh()
+			}
+			if tabData.imageViewer.onActivated != nil {
+				tabData.imageViewer.onActivated()
+			}
+		}
+		return
+	}
+
+	if selectColorToolTab != nil {
+		selectColorToolTab()
+	}
+
+	// 恢复颜色点列表（深拷贝）
+	colorPoints = make([]ColorPoint, len(tabData.colorPoints))
+	copy(colorPoints, tabData.colorPoints)
+
+	// 恢复图像查看器
+	imageViewer = tabData.imageViewer
+
+	// 恢复矩形标记数据（深拷贝）
+	if imageViewer != nil {
+		imageViewer.markRects = make([]MarkRect, len(tabData.markRects))
+		copy(imageViewer.markRects, tabData.markRects)
+		imageViewer.manualRectSelected = tabData.manualRectSelected
+
+		// 更新矩形坐标显示
+		if tabData.manualRectSelected && len(tabData.markRects) > 0 && rectCoordEntry != nil {
+			// 使用最后一个矩形的坐标
+			lastRect := tabData.markRects[len(tabData.markRects)-1]
+			rectCoordEntry.SetText(fmt.Sprintf("%d,%d,%d,%d",
+				lastRect.X1, lastRect.Y1, lastRect.X2, lastRect.Y2))
+		} else if rectCoordEntry != nil {
+			// 如果没有手动框选，根据标记点自动计算矩形范围
+			autoRect := calculateAutoRect()
+			if autoRect != "" {
+				rectCoordEntry.SetText(autoRect)
+			} else {
+				rectCoordEntry.SetText(defaultRangeText)
+			}
+		}
+
+		// 重新绘制图像（显示标记点）
+		imageViewer.Refresh()
+		if imageViewer.onActivated != nil {
+			imageViewer.onActivated()
+		}
+		if imageViewer.window != nil {
+			imageViewer.window.Canvas().Focus(imageViewer)
+		}
+	}
+
+	// 恢复生成的代码
+	if codeDisplayEntry != nil {
+		codeDisplayEntry.SetText(tabData.generatedCode)
+	}
+
+	// 刷新表格显示
+	if refreshColorList != nil {
+		refreshColorList()
+	}
+}
+
+func parsePointPosition(pos string) (int, int, bool) {
+	parts := strings.Split(strings.TrimSpace(pos), ",")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+
+	x, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return 0, 0, false
+	}
+	y, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, 0, false
+	}
+	return x, y, true
+}
+
+func colorPointImagePoint(index int) (image.Point, bool) {
+	if index < 0 || index >= len(colorPoints) {
+		return image.Point{}, false
+	}
+	x, y, ok := parsePointPosition(colorPoints[index].Position)
+	if !ok {
+		return image.Point{}, false
+	}
+	return image.Pt(x, y), true
+}
+
+func nearestColorPointIndex(points []ColorPoint, x, y, radius int) int {
+	bestIndex := -1
+	bestDistance := float64(radius + 1)
+	for i, point := range points {
+		pointX, pointY, ok := parsePointPosition(point.Position)
+		if !ok {
+			continue
+		}
+		dist := distance(x, y, pointX, pointY)
+		if dist <= float64(radius) && dist < bestDistance {
+			bestDistance = dist
+			bestIndex = i
+		}
+	}
+	return bestIndex
+}
+
+func linkedColorPointRowBackground(id int) color.Color {
+	if id >= 0 && id < len(colorPoints) && id == linkedColorPointIndex && linkedColorPointFlashVisible {
+		return linkedRowBgColor
+	}
+	return transparent
+}
+
+func setLinkedColorPointVisual(index int, visible bool) {
+	if index < 0 || index >= len(colorPoints) {
+		linkedColorPointIndex = -1
+		linkedColorPointFlashVisible = false
+		if imageViewer != nil {
+			imageViewer.ClearLinkedPointHighlight()
+		}
+		if tableContent != nil {
+			tableContent.Refresh()
+		}
+		return
+	}
+
+	linkedColorPointIndex = index
+	linkedColorPointFlashVisible = visible
+	if imageViewer != nil {
+		if point, ok := colorPointImagePoint(index); ok && visible {
+			imageViewer.SetLinkedPointHighlight([]image.Point{point})
+		} else {
+			imageViewer.ClearLinkedPointHighlight()
+		}
+	}
+	if tableContent != nil {
+		tableContent.Refresh()
+	}
+}
+
+func clearLinkedColorPointVisual() {
+	atomic.AddUint64(&linkedColorPointFlashSeq, 1)
+	setLinkedColorPointVisual(-1, false)
+}
+
+func activateLinkedColorPoint(index int) {
+	if index < 0 || index >= len(colorPoints) {
+		return
+	}
+
+	seq := atomic.AddUint64(&linkedColorPointFlashSeq, 1)
+	setLinkedColorPointVisual(index, true)
+	if tableContent != nil {
+		tableContent.Select(widget.ListItemID(index))
+		tableContent.ScrollTo(widget.ListItemID(index))
+	}
+
+	go func() {
+		for i := 0; i < linkedPointFlashCount; i++ {
+			visible := i%2 == 0
+			fyne.Do(func() {
+				if atomic.LoadUint64(&linkedColorPointFlashSeq) == seq {
+					setLinkedColorPointVisual(index, visible)
+				}
+			})
+			time.Sleep(linkedPointFlashInterval)
+		}
+
+		fyne.Do(func() {
+			if atomic.LoadUint64(&linkedColorPointFlashSeq) == seq {
+				setLinkedColorPointVisual(index, true)
+			}
+		})
+		time.Sleep(linkedPointHoldAfterFlash)
+		fyne.Do(func() {
+			if atomic.LoadUint64(&linkedColorPointFlashSeq) == seq {
+				setLinkedColorPointVisual(-1, false)
+			}
+		})
+	}()
+}
+
+func refreshLinkedColorPointVisual() {
+	if linkedColorPointIndex < 0 {
+		return
+	}
+	if linkedColorPointIndex >= len(colorPoints) {
+		clearLinkedColorPointVisual()
+		return
+	}
+	setLinkedColorPointVisual(linkedColorPointIndex, linkedColorPointFlashVisible)
+}
+
+func colorHexAtImage(img image.Image, x, y int) (string, color.Color, bool) {
+	if img == nil {
+		return "", nil, false
+	}
+
+	bounds := img.Bounds()
+	if x < bounds.Min.X || x >= bounds.Max.X || y < bounds.Min.Y || y >= bounds.Max.Y {
+		return "", nil, false
+	}
+
+	pixelColor := img.At(x, y)
+	r, g, b, _ := pixelColor.RGBA()
+	return fmt.Sprintf("#%02X%02X%02X", uint8(r>>8), uint8(g>>8), uint8(b>>8)), pixelColor, true
+}
+
+func setRectCoordText(text string) {
+	if rectCoordEntry != nil {
+		rectCoordEntry.SetText(text)
+	}
+}
+
+func setColorPointAt(index, x, y int) bool {
+	if index < 0 || index >= maxRightMenuPoints || imageViewer == nil || imageViewer.image == nil {
+		return false
+	}
+
+	hexColor, _, ok := colorHexAtImage(imageViewer.image, x, y)
+	if !ok {
+		return false
+	}
+
+	point := ColorPoint{
+		ID:       index,
+		Position: fmt.Sprintf("%d, %d", x, y),
+		Color:    hexColor,
+		Offset:   defaultColorPointOffset,
+		Selected: true,
+	}
+
+	if index < len(colorPoints) {
+		point.Offset = colorPoints[index].Offset
+		point.Selected = colorPoints[index].Selected
+		colorPoints[index] = point
+	} else if index == len(colorPoints) {
+		colorPoints = append(colorPoints, point)
+	} else {
+		return false
+	}
+
+	syncImageViewerMarksFromColorPoints()
+	updateTableSelection()
+	return true
+}
+
+func normalizeColorOffset(text string) (string, bool) {
+	text = strings.TrimPrefix(strings.TrimSpace(text), "#")
+	if len(text) != 6 {
+		return "", false
+	}
+
+	for _, c := range text {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return "", false
+		}
+	}
+	return strings.ToUpper(text), true
+}
+
+func refreshColorPointFromImage(index int) bool {
+	if index < 0 || index >= len(colorPoints) || imageViewer == nil || imageViewer.image == nil {
+		return false
+	}
+
+	x, y, ok := parsePointPosition(colorPoints[index].Position)
+	if !ok {
+		return false
+	}
+
+	hexColor, _, ok := colorHexAtImage(imageViewer.image, x, y)
+	if !ok {
+		return false
+	}
+
+	colorPoints[index].Color = hexColor
+	return true
+}
+
+func refreshAllColorPointsFromImage() {
+	for i := range colorPoints {
+		refreshColorPointFromImage(i)
+	}
+}
+
+func syncImageViewerMarksFromColorPoints() {
+	if imageViewer == nil {
+		return
+	}
+
+	imageViewer.markPoints = imageViewer.markPoints[:0]
+	for _, point := range colorPoints {
+		x, y, ok := parsePointPosition(point.Position)
+		if !ok {
+			continue
+		}
+		imageViewer.markPoints = append(imageViewer.markPoints, MarkPoint{
+			X:     x,
+			Y:     y,
+			Color: getInverseColor(hexToColor(point.Color)),
+		})
+	}
+
+	if !imageViewer.manualRectSelected {
+		imageViewer.updateBoundingBox()
+	}
+	refreshLinkedColorPointVisual()
+	imageViewer.Refresh()
+}
+
+func commitColorPointPosition(index int, value string) {
+	if index < 0 || index >= len(colorPoints) {
+		return
+	}
+
+	x, y, ok := parsePointPosition(value)
+	if !ok {
+		updateTableSelection()
+		return
+	}
+
+	if imageViewer == nil || imageViewer.image == nil {
+		colorPoints[index].Position = fmt.Sprintf("%d, %d", x, y)
+		updateTableSelection()
+		return
+	}
+
+	hexColor, _, ok := colorHexAtImage(imageViewer.image, x, y)
+	if !ok {
+		updateTableSelection()
+		return
+	}
+
+	colorPoints[index].Position = fmt.Sprintf("%d, %d", x, y)
+	colorPoints[index].Color = hexColor
+	syncImageViewerMarksFromColorPoints()
+	updateTableSelection()
+}
+
+func colorPointCoordinatesText() string {
+	positions := make([]string, 0, len(colorPoints))
+	for _, point := range colorPoints {
+		x, y, ok := parsePointPosition(point.Position)
+		if !ok {
+			continue
+		}
+		positions = append(positions, fmt.Sprintf("%d, %d", x, y))
+	}
+	return strings.Join(positions, "\n")
+}
+
+func parsePointPositionsText(text string) []image.Point {
+	lines := strings.FieldsFunc(text, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ';'
+	})
+
+	points := make([]image.Point, 0, len(lines))
+	for _, line := range lines {
+		x, y, ok := parsePointPosition(line)
+		if !ok {
+			continue
+		}
+		points = append(points, image.Pt(x, y))
+	}
+	return points
+}
+
+func replaceColorPointsByPositions(points []image.Point, offset string) {
+	if imageViewer == nil || imageViewer.image == nil {
+		return
+	}
+
+	colorPoints = colorPoints[:0]
+	for _, point := range points {
+		hexColor, _, ok := colorHexAtImage(imageViewer.image, point.X, point.Y)
+		if !ok {
+			continue
+		}
+
+		colorPoints = append(colorPoints, ColorPoint{
+			ID:       len(colorPoints),
+			Position: fmt.Sprintf("%d, %d", point.X, point.Y),
+			Color:    hexColor,
+			Offset:   offset,
+			Selected: true,
+		})
+	}
+
+	syncImageViewerMarksFromColorPoints()
+	updateTableSelection()
+}
+
+// 根据颜色点自动计算矩形范围
+func calculateAutoRect() string {
+	if len(colorPoints) == 0 {
+		return ""
+	}
+
+	// 找到所有点的最小和最大坐标
+	minX, minY := int(^uint(0)>>1), int(^uint(0)>>1) // int 最大值
+	maxX, maxY := 0, 0
+	validCount := 0
+
+	for _, point := range colorPoints {
+		x, y, ok := parsePointPosition(point.Position)
+		if !ok {
+			continue
+		}
+		validCount++
+
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	if validCount == 0 {
+		return ""
+	}
+
+	// 如果只有一个点，创建一个小的矩形范围
+	if minX == maxX && minY == maxY {
+		// 以该点为中心，创建一个10x10的矩形
+		minX -= 5
+		minY -= 5
+		maxX += 5
+		maxY += 5
+	}
+
+	// 添加一些边距（10像素）
+	minX -= 10
+	minY -= 10
+	maxX += 10
+	maxY += 10
+
+	// 确保坐标不为负数
+	if minX < 0 {
+		minX = 0
+	}
+	if minY < 0 {
+		minY = 0
+	}
+
+	// 如果有图像，确保不超出图像范围
+	if imageViewer != nil && imageViewer.image != nil {
+		bounds := imageViewer.image.Bounds()
+		if maxX > bounds.Max.X {
+			maxX = bounds.Max.X
+		}
+		if maxY > bounds.Max.Y {
+			maxY = bounds.Max.Y
+		}
+	}
+
+	return fmt.Sprintf("%d,%d,%d,%d", minX, minY, maxX, maxY)
+}
+
+// 获取偏色值，返回字符串（十六进制格式），如果输入无效则返回默认值"101010"
+func getColorOffset() string {
+	if colorOffsetEntry == nil {
+		return "101010" // 默认值
+	}
+
+	text := strings.TrimSpace(colorOffsetEntry.Text)
+	if text == "" {
+		return "101010" // 空值时返回默认值
+	}
+
+	// 移除可能的#前缀
+	text = strings.TrimPrefix(text, "#")
+
+	// 验证是否为有效的十六进制字符串（6位）
+	if offset, ok := normalizeColorOffset(text); ok {
+		return offset // 返回大写格式
+	}
+
+	return "101010" // 长度不对，返回默认值
+}
+
+func colorPointValue(point ColorPoint) string {
+	colorValue := strings.ToLower(strings.TrimPrefix(point.Color, "#"))
+	if offset, ok := normalizeColorOffset(point.Offset); ok {
+		return fmt.Sprintf("%s-%s", colorValue, offset)
+	}
+	return colorValue
+}
+
+func selectedColorPoints() []ColorPoint {
+	points := make([]ColorPoint, 0, len(colorPoints))
+	for _, point := range colorPoints {
+		if point.Selected {
+			points = append(points, point)
+		}
+	}
+	return points
+}
+
+func regionValuesFromEntry() (int, int, int, int) {
+	if rectCoordEntry == nil {
+		return 0, 0, 0, 0
+	}
+
+	parts := strings.Split(strings.TrimSpace(rectCoordEntry.Text), ",")
+	if len(parts) != 4 {
+		return 0, 0, 0, 0
+	}
+
+	values := [4]int{}
+	for i, part := range parts {
+		value, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
+			return 0, 0, 0, 0
+		}
+		values[i] = value
+	}
+	return values[0], values[1], values[2], values[3]
+}
+
+func directionValue(directionText string) int {
+	if strings.HasPrefix(strings.TrimSpace(directionText), "1") {
+		return 1
+	}
+	if strings.HasPrefix(strings.TrimSpace(directionText), "2") {
+		return 2
+	}
+	if strings.HasPrefix(strings.TrimSpace(directionText), "3") {
+		return 3
+	}
+	return 0
+}
+
+func parseSimilarityValue(precisionText string) float32 {
+	simText := strings.TrimSpace(precisionText)
+	if simText == "" {
+		return 0.9
+	}
+	sim, err := strconv.ParseFloat(simText, 32)
+	if err != nil {
+		return 0.9
+	}
+	return float32(sim)
+}
+
+func apiColorAlternatives(points []ColorPoint) string {
+	colors := make([]string, 0, len(points))
+	for _, point := range points {
+		colors = append(colors, colorPointValue(point))
+	}
+	return strings.Join(colors, "|")
+}
+
+func apiMultiColorTemplate(points []ColorPoint) string {
+	if len(points) == 0 {
+		return ""
+	}
+
+	baseX, baseY, ok := parsePointPosition(points[0].Position)
+	if !ok {
+		return ""
+	}
+
+	parts := []string{colorPointValue(points[0])}
+	for _, point := range points[1:] {
+		x, y, ok := parsePointPosition(point.Position)
+		if !ok {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%d,%d,%s", x-baseX, y-baseY, colorPointValue(point)))
+	}
+	return strings.Join(parts, ",")
+}
+
+type imageSearchRange struct {
+	x1, x2 int
+	y1, y2 int
+	stepX  int
+	stepY  int
+}
+
+type testColorInfo struct {
+	x, y int
+	c2   color.NRGBA
+	c3   color.NRGBA
+}
+
+func sanitizeTestColorText(text string) string {
+	replacer := strings.NewReplacer("[", "", "]", "", "#", "", " ", "", `"`, "")
+	return replacer.Replace(text)
+}
+
+func imageSearchBounds(img image.Image, x1, y1, x2, y2 int) (int, int, int, int, bool) {
+	if img == nil {
+		return 0, 0, 0, 0, false
+	}
+
+	width := img.Bounds().Dx()
+	height := img.Bounds().Dy()
+	if x2 == 0 || x2 > width {
+		x2 = width
+	}
+	if y2 == 0 || y2 > height {
+		y2 = height
+	}
+	if x1 < 0 || y1 < 0 || x2 > width || y2 > height || x1 >= x2 || y1 >= y2 {
+		return 0, 0, 0, 0, false
+	}
+	return x1, y1, x2, y2, true
+}
+
+func genImageSearchRange(dir, x1, y1, x2, y2 int) imageSearchRange {
+	switch dir {
+	case 1:
+		return imageSearchRange{x1: x2 - 1, x2: x1 - 1, y1: y1, y2: y2, stepX: -1, stepY: 1}
+	case 2:
+		return imageSearchRange{x1: x1, x2: x2, y1: y2 - 1, y2: y1 - 1, stepX: 1, stepY: -1}
+	case 3:
+		return imageSearchRange{x1: x2 - 1, x2: x1 - 1, y1: y2 - 1, y2: y1 - 1, stepX: -1, stepY: -1}
+	default:
+		return imageSearchRange{x1: x1, x2: x2, y1: y1, y2: y2, stepX: 1, stepY: 1}
+	}
+}
+
+func imagePixelNRGBA(img image.Image, x, y int) color.NRGBA {
+	bounds := img.Bounds()
+	return color.NRGBAModel.Convert(img.At(bounds.Min.X+x, bounds.Min.Y+y)).(color.NRGBA)
+}
+
+func absDiffUint8(a, b uint8) uint8 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+func testColorMatch(c1, c2, c3 color.NRGBA) bool {
+	return absDiffUint8(c1.R, c2.R) <= c3.R &&
+		absDiffUint8(c1.G, c2.G) <= c3.G &&
+		absDiffUint8(c1.B, c2.B) <= c3.B
+}
+
+func parseTestColor(colorStr string, sim float32) (color.NRGBA, color.NRGBA, bool) {
+	colorStr = sanitizeTestColorText(colorStr)
+	parts := strings.Split(colorStr, "-")
+	if len(parts) == 0 || len(parts[0]) < 6 {
+		return color.NRGBA{}, color.NRGBA{}, false
+	}
+
+	parseHex := func(text string) (uint8, uint8, uint8, bool) {
+		if len(text) < 6 {
+			return 0, 0, 0, false
+		}
+		r, errR := strconv.ParseUint(text[0:2], 16, 8)
+		g, errG := strconv.ParseUint(text[2:4], 16, 8)
+		b, errB := strconv.ParseUint(text[4:6], 16, 8)
+		if errR != nil || errG != nil || errB != nil {
+			return 0, 0, 0, false
+		}
+		return uint8(r), uint8(g), uint8(b), true
+	}
+
+	r, g, b, ok := parseHex(parts[0])
+	if !ok {
+		return color.NRGBA{}, color.NRGBA{}, false
+	}
+	base := color.NRGBA{R: r, G: g, B: b, A: 255}
+
+	var tolerance uint8
+	if sim > 0 {
+		tolerance = uint8((1.0 - sim) * 255)
+	}
+
+	if len(parts) > 1 {
+		r, g, b, ok := parseHex(parts[1])
+		if !ok {
+			return color.NRGBA{}, color.NRGBA{}, false
+		}
+		return base, color.NRGBA{R: r + tolerance, G: g + tolerance, B: b + tolerance, A: 255}, true
+	}
+	return base, color.NRGBA{R: tolerance, G: tolerance, B: tolerance, A: 255}, true
+}
+
+func testColorAlternativesMatch(c color.NRGBA, colorText string, sim float32) bool {
+	colorText = sanitizeTestColorText(colorText)
+	for _, part := range strings.Split(colorText, "|") {
+		base, tolerance, ok := parseTestColor(part, sim)
+		if ok && testColorMatch(c, base, tolerance) {
+			return true
+		}
+	}
+	return false
+}
+
+func findColorInImage(img image.Image, x1, y1, x2, y2 int, colorText string, sim float32, dir int) (int, int) {
+	x1, y1, x2, y2, ok := imageSearchBounds(img, x1, y1, x2, y2)
+	if !ok {
+		return -1, -1
+	}
+
+	rng := genImageSearchRange(dir, x1, y1, x2, y2)
+	for y := rng.y1; y != rng.y2; y += rng.stepY {
+		for x := rng.x1; x != rng.x2; x += rng.stepX {
+			if testColorAlternativesMatch(imagePixelNRGBA(img, x, y), colorText, sim) {
+				return x, y
+			}
+		}
+	}
+	return -1, -1
+}
+
+func parseRemainingTestColors(parts []string, sim float32) ([]testColorInfo, bool) {
+	infos := make([]testColorInfo, 0, len(parts)/3)
+	for i := 0; i < len(parts); i += 3 {
+		x, errX := strconv.Atoi(parts[i])
+		y, errY := strconv.Atoi(parts[i+1])
+		base, tolerance, ok := parseTestColor(parts[i+2], sim)
+		if errX != nil || errY != nil || !ok {
+			return nil, false
+		}
+		infos = append(infos, testColorInfo{x: x, y: y, c2: base, c3: tolerance})
+	}
+	return infos, true
+}
+
+func compareTestColorSequence(img image.Image, x, y int, infos []testColorInfo) bool {
+	width := img.Bounds().Dx()
+	height := img.Bounds().Dy()
+	for _, info := range infos {
+		offsetX := x + info.x
+		offsetY := y + info.y
+		if offsetX < 0 || offsetY < 0 || offsetX >= width || offsetY >= height {
+			return false
+		}
+		if !testColorMatch(imagePixelNRGBA(img, offsetX, offsetY), info.c2, info.c3) {
+			return false
+		}
+	}
+	return true
+}
+
+func multiColorMatchRect(x, y int, infos []testColorInfo) image.Rectangle {
+	minX, maxX := 0, 0
+	minY, maxY := 0, 0
+	for _, info := range infos {
+		if info.x < minX {
+			minX = info.x
+		}
+		if info.x > maxX {
+			maxX = info.x
+		}
+		if info.y < minY {
+			minY = info.y
+		}
+		if info.y > maxY {
+			maxY = info.y
+		}
+	}
+	return image.Rect(x+minX, y+minY, x+maxX+1, y+maxY+1)
+}
+
+func imageRectsOverlap(a, b image.Rectangle) bool {
+	return a.Min.X < b.Max.X &&
+		b.Min.X < a.Max.X &&
+		a.Min.Y < b.Max.Y &&
+		b.Min.Y < a.Max.Y
+}
+
+func overlapsAcceptedMultiColorMatch(rect image.Rectangle, accepted []image.Rectangle) bool {
+	for _, item := range accepted {
+		if imageRectsOverlap(rect, item) {
+			return true
+		}
+	}
+	return false
+}
+
+func findMultiColorsInImage(img image.Image, x1, y1, x2, y2 int, colorsText string, sim float32, dir int) (int, int) {
+	x1, y1, x2, y2, ok := imageSearchBounds(img, x1, y1, x2, y2)
+	if !ok {
+		return -1, -1
+	}
+
+	parts := strings.Split(sanitizeTestColorText(colorsText), ",")
+	if len(parts) < 4 || len(parts)%3 != 1 {
+		return -1, -1
+	}
+
+	baseColor, baseTolerance, ok := parseTestColor(parts[0], sim)
+	if !ok {
+		return -1, -1
+	}
+	infos, ok := parseRemainingTestColors(parts[1:], sim)
+	if !ok {
+		return -1, -1
+	}
+
+	rng := genImageSearchRange(dir, x1, y1, x2, y2)
+	for y := rng.y1; y != rng.y2; y += rng.stepY {
+		for x := rng.x1; x != rng.x2; x += rng.stepX {
+			if testColorMatch(imagePixelNRGBA(img, x, y), baseColor, baseTolerance) &&
+				compareTestColorSequence(img, x, y, infos) {
+				return x, y
+			}
+		}
+	}
+	return -1, -1
+}
+
+func findMultiColorsAllInImage(img image.Image, x1, y1, x2, y2 int, colorsText string, sim float32, dir int) []image.Point {
+	x1, y1, x2, y2, ok := imageSearchBounds(img, x1, y1, x2, y2)
+	if !ok {
+		return nil
+	}
+
+	parts := strings.Split(sanitizeTestColorText(colorsText), ",")
+	if len(parts) < 4 || len(parts)%3 != 1 {
+		return nil
+	}
+
+	baseColor, baseTolerance, ok := parseTestColor(parts[0], sim)
+	if !ok {
+		return nil
+	}
+	infos, ok := parseRemainingTestColors(parts[1:], sim)
+	if !ok {
+		return nil
+	}
+
+	matches := make([]image.Point, 0)
+	// Suppress duplicate anchors that cover the same template area.
+	acceptedRects := make([]image.Rectangle, 0)
+	rng := genImageSearchRange(dir, x1, y1, x2, y2)
+	for y := rng.y1; y != rng.y2; y += rng.stepY {
+		for x := rng.x1; x != rng.x2; x += rng.stepX {
+			if testColorMatch(imagePixelNRGBA(img, x, y), baseColor, baseTolerance) &&
+				compareTestColorSequence(img, x, y, infos) {
+				rect := multiColorMatchRect(x, y, infos)
+				if overlapsAcceptedMultiColorMatch(rect, acceptedRects) {
+					continue
+				}
+				matches = append(matches, image.Pt(x, y))
+				acceptedRects = append(acceptedRects, rect)
+			}
+		}
+	}
+	return matches
+}
+
+func formatFindTestPoints(points []image.Point) string {
+	if len(points) == 0 {
+		return "[]"
+	}
+
+	parts := make([]string, 0, len(points))
+	for _, point := range points {
+		parts = append(parts, fmt.Sprintf("    {%d %d}", point.X, point.Y))
+	}
+	return "[\n" + strings.Join(parts, "\n") + "\n]"
+}
+
+func runImageCmpColorTestPoint(img image.Image, precisionText string) (image.Point, bool) {
+	if img == nil {
+		return image.Point{}, false
+	}
+
+	points := selectedColorPoints()
+	if len(points) == 0 {
+		return image.Point{}, false
+	}
+
+	x, y, ok := parsePointPosition(points[0].Position)
+	if !ok {
+		return image.Point{}, false
+	}
+	if !image.Pt(x, y).In(image.Rect(0, 0, img.Bounds().Dx(), img.Bounds().Dy())) {
+		return image.Point{}, false
+	}
+	if !testColorAlternativesMatch(imagePixelNRGBA(img, x, y), apiColorAlternatives(points), parseSimilarityValue(precisionText)) {
+		return image.Point{}, false
+	}
+	return image.Pt(x, y), true
+}
+
+func runImageCmpColorTest(img image.Image, precisionText string) bool {
+	_, matched := runImageCmpColorTestPoint(img, precisionText)
+	return matched
+}
+
+func foundPointHighlights(x, y int) []image.Point {
+	if x < 0 || y < 0 {
+		return nil
+	}
+	return []image.Point{image.Pt(x, y)}
+}
+
+func runImageFindTest(img image.Image, functionName, precisionText, directionText string) (int, int) {
+	if img == nil {
+		return -1, -1
+	}
+
+	points := selectedColorPoints()
+	if len(points) == 0 {
+		return -1, -1
+	}
+
+	sim := parseSimilarityValue(precisionText)
+	dir := directionValue(directionText)
+	x1, y1, x2, y2 := regionValuesFromEntry()
+	switch normalizeImagesFunctionName(functionName) {
+	case "FindColor":
+		return findColorInImage(img, x1, y1, x2, y2, apiColorAlternatives(points), sim, dir)
+	case "FindMultiColorsAll":
+		points := findMultiColorsAllInImage(img, x1, y1, x2, y2, apiMultiColorTemplate(points), sim, dir)
+		if len(points) == 0 {
+			return -1, -1
+		}
+		return points[0].X, points[0].Y
+	default:
+		return findMultiColorsInImage(img, x1, y1, x2, y2, apiMultiColorTemplate(points), sim, dir)
+	}
+}
+
+func runImageFindTestResult(img image.Image, functionName, precisionText, directionText string) string {
+	result, _ := runImageFindTestResultAndHighlights(img, functionName, precisionText, directionText)
+	return result
+}
+
+func runImageFindTestHighlightPoints(img image.Image, functionName, precisionText, directionText string) []image.Point {
+	_, points := runImageFindTestResultAndHighlights(img, functionName, precisionText, directionText)
+	return points
+}
+
+func runImageFindTestResultAndHighlights(img image.Image, functionName, precisionText, directionText string) (string, []image.Point) {
+	functionName = normalizeImagesFunctionName(functionName)
+	if functionName == "CmpColor" {
+		point, matched := runImageCmpColorTestPoint(img, precisionText)
+		if matched {
+			return "true", []image.Point{point}
+		}
+		return "false", nil
+	}
+
+	if img == nil || len(selectedColorPoints()) == 0 {
+		if functionName == "FindMultiColorsAll" {
+			return "[]", nil
+		}
+		return "-1,-1", nil
+	}
+
+	sim := parseSimilarityValue(precisionText)
+	dir := directionValue(directionText)
+	x1, y1, x2, y2 := regionValuesFromEntry()
+	if functionName == "FindMultiColorsAll" {
+		points := findMultiColorsAllInImage(img, x1, y1, x2, y2, apiMultiColorTemplate(selectedColorPoints()), sim, dir)
+		return formatFindTestPoints(points), points
+	}
+
+	x, y := runImageFindTest(img, functionName, precisionText, directionText)
+	return fmt.Sprintf("%d,%d", x, y), foundPointHighlights(x, y)
+}
+
+func defaultCodeTestParams(functionName string) string {
+	switch normalizeImagesFunctionName(functionName) {
+	case "FindColor":
+		return `0, 0, 0, 0, "FFFFFF|CCCCCC-101010", 0.9, 0, 0`
+	case "FindMultiColorsAll":
+		return `0, 0, 0, 0, "ffccff-151515,635,978,ffab2d-101010", 0.9, 0, 0`
+	case "CmpColor":
+		return `100, 200, "FFFFFF|CCCCCC-101010", 0.9, 0`
+	default:
+		return `0, 0, 0, 0, "ffccff-151515,635,978,ffab2d-101010", 0.9, 0, 0`
+	}
+}
+
+func codeTestExampleParams(functionName, precisionText, directionText string) string {
+	_, params, _ := buildImagesAPICode(functionName, precisionText, directionText)
+	if strings.TrimSpace(params) != "" {
+		return params
+	}
+	return defaultCodeTestParams(functionName)
+}
+
+func normalizeCodeTestParamsText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+
+	if openIndex := strings.Index(text, "("); openIndex >= 0 {
+		if closeIndex := strings.LastIndex(text, ")"); closeIndex > openIndex {
+			text = text[openIndex+1 : closeIndex]
+		}
+	}
+
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "{") && strings.HasSuffix(text, "}") && len(text) >= 2 {
+		text = strings.TrimSpace(text[1 : len(text)-1])
+	}
+	return text
+}
+
+func splitCodeTestArgs(text string) ([]string, error) {
+	text = normalizeCodeTestParamsText(text)
+	if text == "" {
+		return nil, fmt.Errorf("请输入参数")
+	}
+
+	args := make([]string, 0)
+	var current strings.Builder
+	inQuote := false
+	escaped := false
+	for _, r := range text {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && inQuote {
+			current.WriteRune(r)
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuote = !inQuote
+			current.WriteRune(r)
+			continue
+		}
+		if r == ',' && !inQuote {
+			args = append(args, strings.TrimSpace(current.String()))
+			current.Reset()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	if inQuote {
+		return nil, fmt.Errorf("字符串参数缺少结束双引号")
+	}
+	args = append(args, strings.TrimSpace(current.String()))
+	for _, arg := range args {
+		if arg == "" {
+			return nil, fmt.Errorf("参数中包含空值")
+		}
+	}
+	return args, nil
+}
+
+func unquoteCodeTestArg(arg string) (string, error) {
+	arg = strings.TrimSpace(arg)
+	if len(arg) >= 2 && strings.HasPrefix(arg, `"`) && strings.HasSuffix(arg, `"`) {
+		value, err := strconv.Unquote(arg)
+		if err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+	return arg, nil
+}
+
+func parseCodeTestInt(args []string, index int, name string) (int, error) {
+	if index >= len(args) {
+		return 0, fmt.Errorf("缺少参数 %s", name)
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(args[index]))
+	if err != nil {
+		return 0, fmt.Errorf("%s 必须是整数", name)
+	}
+	return value, nil
+}
+
+func parseCodeTestFloat(args []string, index int, name string) (float32, error) {
+	if index >= len(args) {
+		return 0, fmt.Errorf("缺少参数 %s", name)
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(args[index]), 32)
+	if err != nil {
+		return 0, fmt.Errorf("%s 必须是数字", name)
+	}
+	return float32(value), nil
+}
+
+func parseCodeTestString(args []string, index int, name string) (string, error) {
+	if index >= len(args) {
+		return "", fmt.Errorf("缺少参数 %s", name)
+	}
+	value, err := unquoteCodeTestArg(args[index])
+	if err != nil {
+		return "", fmt.Errorf("%s 字符串格式错误", name)
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s 不能为空", name)
+	}
+	return value, nil
+}
+
+func validateCodeTestArgCount(functionName string, args []string) error {
+	switch normalizeImagesFunctionName(functionName) {
+	case "CmpColor":
+		if len(args) != 4 && len(args) != 5 {
+			return fmt.Errorf("CmpColor 参数应为 5 个：x, y, colorStr, sim, displayId")
+		}
+	default:
+		if len(args) != 7 && len(args) != 8 {
+			return fmt.Errorf("%s 参数应为 8 个：x1, y1, x2, y2, colors/colorStr, sim, dir, displayId", normalizeImagesFunctionName(functionName))
+		}
+	}
+	return nil
+}
+
+func runCodeTestForImage(img image.Image, functionName, paramsText string) string {
+	if img == nil {
+		return "请先截图或导入图片"
+	}
+
+	functionName = normalizeImagesFunctionName(functionName)
+	args, err := splitCodeTestArgs(paramsText)
+	if err != nil {
+		return "参数错误：" + err.Error()
+	}
+	if err := validateCodeTestArgCount(functionName, args); err != nil {
+		return "参数错误：" + err.Error()
+	}
+
+	switch functionName {
+	case "FindColor":
+		x1, err := parseCodeTestInt(args, 0, "x1")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		y1, err := parseCodeTestInt(args, 1, "y1")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		x2, err := parseCodeTestInt(args, 2, "x2")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		y2, err := parseCodeTestInt(args, 3, "y2")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		colorText, err := parseCodeTestString(args, 4, "colorStr")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		sim, err := parseCodeTestFloat(args, 5, "sim")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		dir, err := parseCodeTestInt(args, 6, "dir")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		x, y := findColorInImage(img, x1, y1, x2, y2, colorText, sim, dir)
+		return fmt.Sprintf("%d,%d", x, y)
+	case "FindMultiColorsAll":
+		x1, err := parseCodeTestInt(args, 0, "x1")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		y1, err := parseCodeTestInt(args, 1, "y1")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		x2, err := parseCodeTestInt(args, 2, "x2")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		y2, err := parseCodeTestInt(args, 3, "y2")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		colorsText, err := parseCodeTestString(args, 4, "colors")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		sim, err := parseCodeTestFloat(args, 5, "sim")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		dir, err := parseCodeTestInt(args, 6, "dir")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		return formatFindTestPoints(findMultiColorsAllInImage(img, x1, y1, x2, y2, colorsText, sim, dir))
+	case "CmpColor":
+		x, err := parseCodeTestInt(args, 0, "x")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		y, err := parseCodeTestInt(args, 1, "y")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		colorText, err := parseCodeTestString(args, 2, "colorStr")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		sim, err := parseCodeTestFloat(args, 3, "sim")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		if !image.Pt(x, y).In(image.Rect(0, 0, img.Bounds().Dx(), img.Bounds().Dy())) {
+			return "false"
+		}
+		return strconv.FormatBool(testColorAlternativesMatch(imagePixelNRGBA(img, x, y), colorText, sim))
+	default:
+		x1, err := parseCodeTestInt(args, 0, "x1")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		y1, err := parseCodeTestInt(args, 1, "y1")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		x2, err := parseCodeTestInt(args, 2, "x2")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		y2, err := parseCodeTestInt(args, 3, "y2")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		colorsText, err := parseCodeTestString(args, 4, "colors")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		sim, err := parseCodeTestFloat(args, 5, "sim")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		dir, err := parseCodeTestInt(args, 6, "dir")
+		if err != nil {
+			return "参数错误：" + err.Error()
+		}
+		x, y := findMultiColorsInImage(img, x1, y1, x2, y2, colorsText, sim, dir)
+		return fmt.Sprintf("%d,%d", x, y)
+	}
+}
+
+func parseCodeTestPointsResult(result string) []image.Point {
+	lines := strings.Split(result, "\n")
+	points := make([]image.Point, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "{")
+		line = strings.TrimSuffix(line, "}")
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		x, errX := strconv.Atoi(fields[0])
+		y, errY := strconv.Atoi(fields[1])
+		if errX == nil && errY == nil && x >= 0 && y >= 0 {
+			points = append(points, image.Pt(x, y))
+		}
+	}
+	return points
+}
+
+func codeTestHighlightPointsFromResult(functionName, paramsText, result string) []image.Point {
+	result = strings.TrimSpace(result)
+	if result == "" || strings.HasPrefix(result, "参数错误：") || strings.HasPrefix(result, "请先") {
+		return nil
+	}
+
+	switch normalizeImagesFunctionName(functionName) {
+	case "FindMultiColorsAll":
+		return parseCodeTestPointsResult(result)
+	case "CmpColor":
+		if result != "true" {
+			return nil
+		}
+		args, err := splitCodeTestArgs(paramsText)
+		if err != nil {
+			return nil
+		}
+		x, err := parseCodeTestInt(args, 0, "x")
+		if err != nil {
+			return nil
+		}
+		y, err := parseCodeTestInt(args, 1, "y")
+		if err != nil {
+			return nil
+		}
+		if x < 0 || y < 0 {
+			return nil
+		}
+		return []image.Point{image.Pt(x, y)}
+	default:
+		x, y, ok := parsePointPosition(result)
+		if !ok || x < 0 || y < 0 {
+			return nil
+		}
+		return []image.Point{image.Pt(x, y)}
+	}
+}
+
+func apiRegionParamsObject(x1, y1, x2, y2 int, colorText, sim string, dir int) string {
+	return fmt.Sprintf("{%d,%d,%d,%d,\"%s\",%s,%d,0}", x1, y1, x2, y2, colorText, sim, dir)
+}
+
+func defaultAPIFormatTemplates() map[string]string {
+	return map[string]string{
+		"FindColor":                     "x, y := images.FindColor([参数])",
+		"FindMultiColors":               "x, y := images.FindMultiColors([参数])",
+		"FindMultiColorsAll":            "points := images.FindMultiColorsAll([参数])",
+		"CmpColor":                      "matched := images.CmpColor([参数])",
+		androidNodeSelectorFuncFindOnce: "acc := uiacc.New([屏幕ID])\nobj := acc[参数].FindOnce()",
+		androidNodeSelectorFuncFind:     "acc := uiacc.New([屏幕ID])\nobjs := acc[参数].Find()",
+		androidNodeSelectorFuncWaitFor:  "acc := uiacc.New([屏幕ID])\nobj := acc[参数].WaitFor([超时])",
+	}
+}
+
+func copyAPIFormatTemplates(templates map[string]string) map[string]string {
+	copied := make(map[string]string, len(templates))
+	for key, value := range templates {
+		copied[key] = value
+	}
+	return copied
+}
+
+func normalizeAPIFormatTemplates(templates map[string]string) map[string]string {
+	normalized := defaultAPIFormatTemplates()
+	for key, value := range templates {
+		name := normalizeImagesFunctionName(key)
+		if strings.TrimSpace(value) != "" {
+			normalized[name] = value
+		}
+	}
+	return normalized
+}
+
+func formatTemplateFor(functionName string) string {
+	functionName = normalizeImagesFunctionName(functionName)
+	template := strings.TrimSpace(apiFormatTemplates[functionName])
+	if template != "" {
+		return apiFormatTemplates[functionName]
+	}
+	return defaultAPIFormatTemplates()[functionName]
+}
+
+func applyFormatTemplate(template string, values map[string]string) string {
+	result := template
+	for _, placeholder := range apiFormatPlaceholders {
+		result = strings.ReplaceAll(result, placeholder.token, values[placeholder.token])
+	}
+	return result
+}
+
+func renderImageAPICode(functionName string, values map[string]string) string {
+	return applyFormatTemplate(formatTemplateFor(functionName), values)
+}
+
+func apiFormatValues(functionName, params, colorParams, colorText, sim string, dir, x1, y1, x2, y2, pointX, pointY int) map[string]string {
+	return map[string]string{
+		"[函数名]":      functionName,
+		"[参数]":       params,
+		"[颜色参数]":     colorParams,
+		"[颜色值]":      colorText,
+		"[相似度]":      sim,
+		"[查找方向]":     strconv.Itoa(dir),
+		"[屏幕ID]":     "0",
+		"[范围_左]":     strconv.Itoa(x1),
+		"[范围_上]":     strconv.Itoa(y1),
+		"[范围_右]":     strconv.Itoa(x2),
+		"[范围_下]":     strconv.Itoa(y2),
+		"[坐标_X]":     strconv.Itoa(pointX),
+		"[坐标_Y]":     strconv.Itoa(pointY),
+		"[区域_左上]":    fmt.Sprintf("%d, %d", x1, y1),
+		"[区域_右下]":    fmt.Sprintf("%d, %d", x2, y2),
+		"[CmpColor]": fmt.Sprintf("%d, %d, \"%s\", %s, 0", pointX, pointY, colorText, sim),
+		"[调用]":       "",
+		"[超时]":       "",
+	}
+}
+
+type apiFormatPlaceholder struct {
+	token       string
+	description string
+}
+
+var apiFormatPlaceholders = []apiFormatPlaceholder{
+	{token: "[参数]", description: "完整函数参数"},
+	{token: "[颜色参数]", description: "包含区域、颜色和精度的参数对象"},
+	{token: "[颜色值]", description: "colorStr / colors"},
+	{token: "[相似度]", description: "sim"},
+	{token: "[查找方向]", description: "dir"},
+	{token: "[屏幕ID]", description: "displayId"},
+	{token: "[范围_左]", description: "x1"},
+	{token: "[范围_上]", description: "y1"},
+	{token: "[范围_右]", description: "x2"},
+	{token: "[范围_下]", description: "y2"},
+	{token: "[坐标_X]", description: "x"},
+	{token: "[坐标_Y]", description: "y"},
+	{token: "[函数名]", description: "函数名称"},
+	{token: "[调用]", description: "FindOnce() / Find() / WaitFor(timeout)"},
+	{token: "[超时]", description: "WaitFor 超时毫秒"},
+}
+
+func sampleAPIFormatValues(functionName string) map[string]string {
+	functionName = normalizeImagesFunctionName(functionName)
+	switch functionName {
+	case "FindColor":
+		colorText := "FFFFFF|CCCCCC-101010"
+		params := "0, 0, 0, 0, \"FFFFFF|CCCCCC-101010\", 0.9, 0, 0"
+		return apiFormatValues(functionName, params, apiRegionParamsObject(0, 0, 0, 0, colorText, "0.9", 0), colorText, "0.9", 0, 0, 0, 0, 0, 100, 200)
+	case "FindMultiColorsAll":
+		colorText := "ffccff-151515,635,978,ffab2d-101010"
+		params := "0, 0, 0, 0, \"ffccff-151515,635,978,ffab2d-101010\", 0.9, 0, 0"
+		return apiFormatValues(functionName, params, apiRegionParamsObject(0, 0, 0, 0, colorText, "0.9", 0), colorText, "0.9", 0, 0, 0, 0, 0, 100, 200)
+	case "CmpColor":
+		colorText := "FFFFFF|CCCCCC-101010"
+		params := "100, 200, \"FFFFFF|CCCCCC-101010\", 0.9, 0"
+		return apiFormatValues(functionName, params, fmt.Sprintf("{100,200,\"%s\",0.9,0}", colorText), colorText, "0.9", 0, 0, 0, 0, 0, 100, 200)
+	case androidNodeSelectorFuncFindOnce:
+		chain := ".Text(\"登录\")"
+		return androidNodeSelectorFormatValues(functionName, chain, androidNodeSelectorCall(functionName, androidNodeSelectorDefaultTimeout), androidNodeSelectorDefaultTimeout, "0")
+	case androidNodeSelectorFuncFind:
+		chain := ".TextContains(\"登录\")"
+		return androidNodeSelectorFormatValues(functionName, chain, androidNodeSelectorCall(functionName, androidNodeSelectorDefaultTimeout), androidNodeSelectorDefaultTimeout, "0")
+	case androidNodeSelectorFuncWaitFor:
+		chain := ".Text(\"登录\")"
+		return androidNodeSelectorFormatValues(functionName, chain, androidNodeSelectorCall(functionName, androidNodeSelectorDefaultTimeout), androidNodeSelectorDefaultTimeout, "0")
+	default:
+		colorText := "ffccff-151515,635,978,ffab2d-101010"
+		params := "0, 0, 0, 0, \"ffccff-151515,635,978,ffab2d-101010\", 0.9, 0, 0"
+		return apiFormatValues("FindMultiColors", params, apiRegionParamsObject(0, 0, 0, 0, colorText, "0.9", 0), colorText, "0.9", 0, 0, 0, 0, 0, 100, 200)
+	}
+}
+
+func entryCursorByteIndex(text string, row, column int) int {
+	if row < 0 {
+		row = 0
+	}
+	if column < 0 {
+		column = 0
+	}
+
+	currentRow := 0
+	currentColumn := 0
+	for index, r := range text {
+		if currentRow == row && currentColumn == column {
+			return index
+		}
+		if r == '\n' {
+			if currentRow == row {
+				return index
+			}
+			currentRow++
+			currentColumn = 0
+			continue
+		}
+		if currentRow == row {
+			currentColumn++
+		}
+	}
+	return len(text)
+}
+
+func rowColumnFromByteIndex(text string, byteIndex int) (int, int) {
+	if byteIndex < 0 {
+		byteIndex = 0
+	}
+
+	row := 0
+	column := 0
+	for index, r := range text {
+		if index >= byteIndex {
+			break
+		}
+		if r == '\n' {
+			row++
+			column = 0
+			continue
+		}
+		column++
+	}
+	return row, column
+}
+
+func insertTextAtEntryCursor(entry *widget.Entry, text string) {
+	if entry == nil || text == "" {
+		return
+	}
+
+	insertIndex := entryCursorByteIndex(entry.Text, entry.CursorRow, entry.CursorColumn)
+	newText := entry.Text[:insertIndex] + text + entry.Text[insertIndex:]
+	newRow, newColumn := rowColumnFromByteIndex(newText, insertIndex+len(text))
+	entry.SetText(newText)
+	entry.CursorRow = newRow
+	entry.CursorColumn = newColumn
+	entry.Refresh()
+}
+
+func showAPIFormatDialog(parent fyne.Window, selectedFunction string, saveConfig func(), onSaved ...func()) {
+	functions := []string{
+		"FindMultiColors",
+		"FindColor",
+		"FindMultiColorsAll",
+		"CmpColor",
+		androidNodeSelectorFuncFind,
+		androidNodeSelectorFuncFindOnce,
+		androidNodeSelectorFuncWaitFor,
+	}
+	localTemplates := copyAPIFormatTemplates(normalizeAPIFormatTemplates(apiFormatTemplates))
+	defaultTemplates := defaultAPIFormatTemplates()
+	currentFunction := normalizeImagesFunctionName(selectedFunction)
+
+	templateEntry := widget.NewMultiLineEntry()
+	templateEntry.Wrapping = fyne.TextWrapWord
+	templateEntry.SetMinRowsVisible(8)
+
+	previewLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+	previewLabel.Wrapping = fyne.TextWrapWord
+
+	refreshPreview := func() {
+		localTemplates[currentFunction] = templateEntry.Text
+		previewLabel.SetText(applyFormatTemplate(templateEntry.Text, sampleAPIFormatValues(currentFunction)))
+	}
+	templateEntry.OnChanged = func(string) {
+		refreshPreview()
+	}
+
+	methodSelect := widget.NewSelect(functions, func(value string) {
+		currentFunction = normalizeImagesFunctionName(value)
+		templateEntry.SetText(localTemplates[currentFunction])
+		refreshPreview()
+	})
+
+	placeholderButtons := container.NewVBox()
+	for _, placeholder := range apiFormatPlaceholders {
+		token := placeholder.token
+		label := widget.NewLabel(placeholder.description)
+		label.Wrapping = fyne.TextTruncate
+		placeholderButtons.Add(container.NewBorder(nil, nil, widget.NewButton(token, func() {
+			insertTextAtEntryCursor(templateEntry, token)
+			parent.Canvas().Focus(templateEntry)
+		}), nil, label))
+	}
+
+	leftPanel := container.NewBorder(
+		container.NewVBox(
+			container.NewBorder(nil, nil, widget.NewLabel("模板方法："), nil, methodSelect),
+			widget.NewSeparator(),
+			widget.NewLabel("模板参数"),
+		),
+		nil,
+		nil,
+		nil,
+		container.NewVScroll(placeholderButtons),
+	)
+
+	templateBlock := container.NewBorder(widget.NewLabel("模板内容"), nil, nil, nil, templateEntry)
+	previewBlock := container.NewBorder(widget.NewLabel("实时预览"), nil, nil, nil, container.NewVScroll(container.NewPadded(previewLabel)))
+	rightSplit := container.NewVSplit(templateBlock, previewBlock)
+	rightSplit.Offset = 0.55
+
+	bodySplit := container.NewHSplit(container.New(&fixedWidthLayout{width: 230}, leftPanel), rightSplit)
+	bodySplit.Offset = 0.34
+
+	var formatDialog *dialog.CustomDialog
+	restoreButton := widget.NewButton("还原配置", func() {
+		localTemplates[currentFunction] = defaultTemplates[currentFunction]
+		templateEntry.SetText(localTemplates[currentFunction])
+		refreshPreview()
+	})
+	closeButton := widget.NewButton("关闭", func() {
+		if formatDialog != nil {
+			formatDialog.Hide()
+		}
+	})
+	saveButton := widget.NewButton("保存配置", func() {
+		localTemplates[currentFunction] = templateEntry.Text
+		apiFormatTemplates = copyAPIFormatTemplates(normalizeAPIFormatTemplates(localTemplates))
+		if saveConfig != nil {
+			saveConfig()
+		}
+		refreshImagesAPIFields()
+		for _, refresh := range onSaved {
+			refresh()
+		}
+		if formatDialog != nil {
+			formatDialog.Hide()
+		}
+	})
+	saveButton.Importance = widget.HighImportance
+
+	content := container.NewBorder(nil, container.NewHBox(layout.NewSpacer(), restoreButton, closeButton, saveButton), nil, nil, bodySplit)
+	formatDialog = dialog.NewCustomWithoutButtons("自定义参数格式", content, parent)
+	formatDialog.Resize(fyne.NewSize(720, 520))
+
+	methodSelect.SetSelected(currentFunction)
+	formatDialog.Show()
+}
+
+func showCodeTestDialog(parent fyne.Window, selectedFunction, precisionText, directionText string) {
+	functions := []string{"FindMultiColors", "FindColor", "FindMultiColorsAll", "CmpColor"}
+	currentFunction := normalizeImagesFunctionName(selectedFunction)
+
+	exampleEntry := widget.NewMultiLineEntry()
+	exampleEntry.Wrapping = fyne.TextWrapWord
+	exampleEntry.SetMinRowsVisible(4)
+
+	inputEntry := widget.NewMultiLineEntry()
+	inputEntry.Wrapping = fyne.TextWrapWord
+	inputEntry.SetMinRowsVisible(5)
+	inputEntry.SetPlaceHolder("请输入函数参数，例如：0, 0, 0, 0, \"FFFFFF\", 0.9, 0, 0")
+
+	resultEntry := widget.NewMultiLineEntry()
+	resultEntry.Wrapping = fyne.TextWrapWord
+	resultEntry.SetMinRowsVisible(6)
+	resultEntry.SetPlaceHolder("代码测试结果将显示在这里...")
+
+	refreshExample := func() {
+		example := codeTestExampleParams(currentFunction, precisionText, directionText)
+		exampleEntry.SetText(example)
+		resultEntry.SetText("")
+	}
+
+	methodSelect := widget.NewSelect(functions, func(value string) {
+		currentFunction = normalizeImagesFunctionName(value)
+		refreshExample()
+	})
+
+	var codeDialog *dialog.CustomDialog
+	closeDialog := func() {
+		if codeDialog != nil {
+			codeDialog.Hide()
+		}
+	}
+	topCloseButton := widget.NewButton("关闭", closeDialog)
+	cancelButton := widget.NewButton("取消", closeDialog)
+	testButton := widget.NewButton("代码测试", func() {
+		var img image.Image
+		if imageViewer != nil {
+			img = imageViewer.image
+		}
+		result := runCodeTestForImage(img, currentFunction, inputEntry.Text)
+		resultEntry.SetText(result)
+		if imageViewer != nil {
+			imageViewer.SetFindTestHighlights(codeTestHighlightPointsFromResult(currentFunction, inputEntry.Text, result))
+		}
+	})
+	testButton.Importance = widget.HighImportance
+
+	content := container.NewBorder(
+		container.NewHBox(layout.NewSpacer(), topCloseButton),
+		container.NewHBox(layout.NewSpacer(), cancelButton, testButton),
+		nil,
+		nil,
+		container.NewVBox(
+			container.NewBorder(nil, nil, widget.NewLabel("测试函数"), nil, methodSelect),
+			container.NewBorder(nil, nil, widget.NewLabel("参数例子"), nil, exampleEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("输入参数"), nil, inputEntry),
+			container.NewBorder(nil, nil, widget.NewLabel("查找结果"), nil, resultEntry),
+		),
+	)
+
+	codeDialog = dialog.NewCustomWithoutButtons("代码测试", content, parent)
+	codeDialog.Resize(fyne.NewSize(520, 430))
+	methodSelect.SetSelected(currentFunction)
+	if methodSelect.Selected == "" {
+		refreshExample()
+	}
+	codeDialog.Show()
+}
+
+func refreshImagesAPIFields() {
+	if updateImagesAPIFields != nil {
+		updateImagesAPIFields()
+	}
+}
+
+func normalizeImagesFunctionName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "findcolor":
+		return "FindColor"
+	case "findmulticolors", "findmulticolor":
+		return "FindMultiColors"
+	case "findmulticolorsall", "findmulticolorall":
+		return "FindMultiColorsAll"
+	case "cmpcolor":
+		return "CmpColor"
+	case "find":
+		return androidNodeSelectorFuncFind
+	case "findonce":
+		return androidNodeSelectorFuncFindOnce
+	case "waitfor":
+		return androidNodeSelectorFuncWaitFor
+	default:
+		return "FindMultiColors"
+	}
+}
+
+func buildImagesAPICode(functionName, precisionText, directionText string) (string, string, string) {
+	points := selectedColorPoints()
+	if len(points) == 0 {
+		return "", "", ""
+	}
+
+	sim := strings.TrimSpace(precisionText)
+	if sim == "" {
+		sim = "0.9"
+	}
+	dir := directionValue(directionText)
+	x1, y1, x2, y2 := regionValuesFromEntry()
+	functionName = normalizeImagesFunctionName(functionName)
+
+	switch functionName {
+	case "FindColor":
+		colorText := apiColorAlternatives(points)
+		colorParams := apiRegionParamsObject(x1, y1, x2, y2, colorText, sim, dir)
+		params := fmt.Sprintf("%d, %d, %d, %d, \"%s\", %s, %d, 0", x1, y1, x2, y2, colorText, sim, dir)
+		values := apiFormatValues(functionName, params, colorParams, colorText, sim, dir, x1, y1, x2, y2, 0, 0)
+		return colorText, params, renderImageAPICode(functionName, values)
+	case "FindMultiColorsAll":
+		colorText := apiMultiColorTemplate(points)
+		colorParams := apiRegionParamsObject(x1, y1, x2, y2, colorText, sim, dir)
+		params := fmt.Sprintf("%d, %d, %d, %d, \"%s\", %s, %d, 0", x1, y1, x2, y2, colorText, sim, dir)
+		values := apiFormatValues(functionName, params, colorParams, colorText, sim, dir, x1, y1, x2, y2, 0, 0)
+		return colorText, params, renderImageAPICode(functionName, values)
+	case "CmpColor":
+		x, y, ok := parsePointPosition(points[0].Position)
+		if !ok {
+			return "", "", ""
+		}
+		colorText := apiColorAlternatives(points)
+		colorParams := fmt.Sprintf("{%d,%d,\"%s\",%s,0}", x, y, colorText, sim)
+		params := fmt.Sprintf("%d, %d, \"%s\", %s, 0", x, y, colorText, sim)
+		values := apiFormatValues(functionName, params, colorParams, colorText, sim, dir, x1, y1, x2, y2, x, y)
+		return colorText, params, renderImageAPICode(functionName, values)
+	default:
+		colorText := apiMultiColorTemplate(points)
+		colorParams := apiRegionParamsObject(x1, y1, x2, y2, colorText, sim, dir)
+		params := fmt.Sprintf("%d, %d, %d, %d, \"%s\", %s, %d, 0", x1, y1, x2, y2, colorText, sim, dir)
+		values := apiFormatValues(functionName, params, colorParams, colorText, sim, dir, x1, y1, x2, y2, 0, 0)
+		return colorText, params, renderImageAPICode(functionName, values)
+	}
+}
+
+// 颜色匹配辅助函数
+// 生成找色代码
+func generateColorCode() string {
+	// 检查是否有颜色点
+	if len(colorPoints) == 0 {
+		return ""
+	}
+
+	// 过滤出勾选的颜色点
+	var selectedPoints []ColorPoint
+	for _, point := range colorPoints {
+		if point.Selected {
+			selectedPoints = append(selectedPoints, point)
+		}
+	}
+
+	// 检查是否有勾选的点
+	if len(selectedPoints) == 0 {
+		return ""
+	}
+
+	// 获取找色模式
+	mode := getColorMode()
+
+	if mode == "比色" {
+		// 多点比色格式: "x1,y1,color1-offset,x2,y2,color2-offset,..."
+		var parts []string
+		for _, point := range selectedPoints {
+			x, y, ok := parsePointPosition(point.Position)
+			if !ok {
+				continue
+			}
+
+			// 组合: x,y,color 或 x,y,color-offset
+			parts = append(parts, fmt.Sprintf("%d,%d,%s", x, y, colorPointValue(point)))
+		}
+
+		colorStr := strings.Join(parts, ",")
+		return fmt.Sprintf("images.DetectsMultiColors(\"%s\", 0.9, 0)", colorStr)
+
+	} else {
+		// 多点找色格式: 区域 + "color1-offset,dx2,dy2,color2-offset,dx3,dy3,color3-offset,..."
+
+		// 获取区域坐标
+		rectText := ""
+		if rectCoordEntry != nil {
+			rectText = strings.TrimSpace(rectCoordEntry.Text)
+		}
+
+		// 解析区域坐标 "x1,y1,x2,y2"
+		x1, y1, x2, y2 := "0", "0", "0", "0"
+		if rectText != "" {
+			coords := strings.Split(rectText, ",")
+			if len(coords) == 4 {
+				x1 = strings.TrimSpace(coords[0])
+				y1 = strings.TrimSpace(coords[1])
+				x2 = strings.TrimSpace(coords[2])
+				y2 = strings.TrimSpace(coords[3])
+			}
+		}
+
+		// 获取第一个勾选的点作为基准点
+		firstPoint := selectedPoints[0]
+		baseX, baseY, ok := parsePointPosition(firstPoint.Position)
+		if !ok {
+			return ""
+		}
+
+		var parts []string
+		parts = append(parts, colorPointValue(firstPoint))
+
+		// 后续点使用相对坐标
+		for i := 1; i < len(selectedPoints); i++ {
+			point := selectedPoints[i]
+			x, y, ok := parsePointPosition(point.Position)
+			if !ok {
+				continue
+			}
+
+			// 计算相对坐标
+			dx := x - baseX
+			dy := y - baseY
+
+			// 组合: dx,dy,color 或 dx,dy,color-offset
+			parts = append(parts, fmt.Sprintf("%d,%d,%s", dx, dy, colorPointValue(point)))
+		}
+
+		colorStr := strings.Join(parts, ",")
+		return fmt.Sprintf("images.FindMultiColors(%s, %s, %s, %s, \"%s\", 0.9, 0, 0)", x1, y1, x2, y2, colorStr)
+	}
+}
+
+// 添加点到颜色列表
+func addColorPointToList(x, y int, colorHex string, selected bool) {
+	// 创建新的颜色点
+	newPoint := ColorPoint{
+		ID:       len(colorPoints),
+		Position: fmt.Sprintf("%d, %d", x, y),
+		Color:    colorHex,
+		Offset:   defaultColorPointOffset,
+		Selected: selected,
+	}
+
+	// 添加到列表
+	colorPoints = append(colorPoints, newPoint)
+
+	// 刷新表格显示
+	if refreshColorList != nil {
+		refreshColorList()
+	}
+
+	// 如果当前没有手动框选矩形，自动更新矩形范围
+	if imageViewer != nil && !imageViewer.manualRectSelected && rectCoordEntry != nil {
+		autoRect := calculateAutoRect()
+		if autoRect != "" {
+			rectCoordEntry.SetText(autoRect)
+		}
+	}
+}
+
+// 添加矩形标记 - 确保只有一个矩形
+func (v *ImageViewer) AddRect(x1, y1, x2, y2 int, c color.Color) {
+	if v.nodeToolOnly {
+		return
+	}
+
+	// 清空现有的所有矩形
+	v.markRects = v.markRects[:0]
+
+	// 添加新矩形
+	v.markRects = append(v.markRects, MarkRect{X1: x1, Y1: y1, X2: x2, Y2: y2, Color: c})
+
+	// 标记为手动框选
+	v.manualRectSelected = true
+
+	// 更新坐标显示框
+	if rectCoordEntry != nil {
+		// 确保坐标是左上角到右下角的顺序
+		minX := min(x1, x2)
+		minY := min(y1, y2)
+		maxX := max(x1, x2)
+		maxY := max(y1, y2)
+		rectText := fmt.Sprintf("%d,%d,%d,%d", minX, minY, maxX, maxY)
+
+		// 更新编辑框文本，仅显示四个坐标
+		rectCoordEntry.SetText(rectText)
+		if autoCopyRangeEnabled && v.window != nil {
+			v.window.Clipboard().SetContent(rectText)
+		}
+	}
+
+	v.Refresh() // 刷新视图以显示新矩形
+}
+
+func highlightRectsForPoints(img image.Image, points []image.Point, radius int, c color.Color) []MarkRect {
+	if img == nil || len(points) == 0 {
+		return nil
+	}
+
+	bounds := image.Rect(0, 0, img.Bounds().Dx(), img.Bounds().Dy())
+	rects := make([]MarkRect, 0, len(points))
+	for _, point := range points {
+		if !point.In(bounds) {
+			continue
+		}
+		rects = append(rects, MarkRect{
+			X1:    max(bounds.Min.X, point.X-radius),
+			Y1:    max(bounds.Min.Y, point.Y-radius),
+			X2:    min(bounds.Max.X, point.X+radius+1),
+			Y2:    min(bounds.Max.Y, point.Y+radius+1),
+			Color: c,
+		})
+	}
+	return rects
+}
+
+func findTestHighlightRects(img image.Image, points []image.Point) []MarkRect {
+	return highlightRectsForPoints(img, points, findTestMarkRadius, findTestMarkColor)
+}
+
+func nodeFindTestHighlightRects(img image.Image, rects []image.Rectangle) []MarkRect {
+	if img == nil {
+		return nil
+	}
+
+	bounds := img.Bounds()
+	marks := make([]MarkRect, 0, len(rects))
+	for _, rect := range rects {
+		rect = rect.Intersect(bounds)
+		if rect.Empty() {
+			continue
+		}
+		marks = append(marks, MarkRect{
+			X1:    rect.Min.X,
+			Y1:    rect.Min.Y,
+			X2:    rect.Max.X,
+			Y2:    rect.Max.Y,
+			Color: nodeFindTestColor,
+		})
+	}
+	return marks
+}
+
+func linkedPointHighlightRects(img image.Image, points []image.Point) []MarkRect {
+	return highlightRectsForPoints(img, points, linkedPointMarkRadius, linkedPointColor)
+}
+
+func (v *ImageViewer) SetFindTestHighlights(points []image.Point) {
+	if v.nodeToolOnly {
+		return
+	}
+	v.findTestRects = findTestHighlightRects(v.image, points)
+	if v.image != nil {
+		v.Refresh()
+	}
+}
+
+func (v *ImageViewer) SetNodeFindTestHighlights(rects []image.Rectangle) {
+	if v == nil {
+		return
+	}
+	v.findTestRects = nodeFindTestHighlightRects(v.image, rects)
+	if v.image != nil {
+		v.Refresh()
+	}
+}
+
+func (v *ImageViewer) ClearFindTestHighlights() {
+	if len(v.findTestRects) == 0 {
+		return
+	}
+	v.findTestRects = v.findTestRects[:0]
+	if v.image != nil {
+		v.Refresh()
+	}
+}
+
+func (v *ImageViewer) SetNodeHighlightRect(rect image.Rectangle) {
+	if v == nil || v.image == nil {
+		return
+	}
+
+	rect = rect.Intersect(v.image.Bounds())
+	if rect.Empty() {
+		v.nodeSelectedRects = v.nodeSelectedRects[:0]
+		v.Refresh()
+		return
+	}
+
+	v.nodeSelectedRects = []MarkRect{{
+		X1:    rect.Min.X,
+		Y1:    rect.Min.Y,
+		X2:    rect.Max.X,
+		Y2:    rect.Max.Y,
+		Color: color.NRGBA{255, 170, 0, 255},
+	}}
+	v.Refresh()
+}
+
+func (v *ImageViewer) SetNodeOverlayRects(rects []image.Rectangle) {
+	if v == nil || v.image == nil {
+		return
+	}
+
+	bounds := v.image.Bounds()
+	v.nodeOverlayRects = v.nodeOverlayRects[:0]
+	for _, rect := range rects {
+		rect = rect.Intersect(bounds)
+		if rect.Empty() {
+			continue
+		}
+		v.nodeOverlayRects = append(v.nodeOverlayRects, MarkRect{
+			X1:    rect.Min.X,
+			Y1:    rect.Min.Y,
+			X2:    rect.Max.X,
+			Y2:    rect.Max.Y,
+			Color: color.NRGBA{0, 180, 255, 170},
+		})
+	}
+	v.Refresh()
+}
+
+func (v *ImageViewer) ClearNodeOverlay() {
+	if len(v.nodeOverlayRects) == 0 && len(v.nodeSelectedRects) == 0 {
+		return
+	}
+	v.nodeOverlayRects = v.nodeOverlayRects[:0]
+	v.nodeSelectedRects = v.nodeSelectedRects[:0]
+	if v.image != nil {
+		v.Refresh()
+	}
+}
+
+func (v *ImageViewer) SetLinkedPointHighlight(points []image.Point) {
+	v.linkedPointRects = linkedPointHighlightRects(v.image, points)
+	if v.image != nil {
+		v.Refresh()
+	}
+}
+
+func (v *ImageViewer) ClearLinkedPointHighlight() {
+	if len(v.linkedPointRects) == 0 {
+		return
+	}
+	v.linkedPointRects = v.linkedPointRects[:0]
+	if v.image != nil {
+		v.Refresh()
+	}
+}
+
+// 更新区域坐标为所有点的外包围盒
+func (v *ImageViewer) updateBoundingBox() {
+	// 如果是手动框选的区域，不自动更新
+	if v.manualRectSelected {
+		return
+	}
+
+	// 如果没有点，不更新
+	if len(v.markPoints) == 0 {
+		return
+	}
+
+	// 找出所有点的最小和最大坐标
+	minX := v.markPoints[0].X
+	minY := v.markPoints[0].Y
+	maxX := v.markPoints[0].X
+	maxY := v.markPoints[0].Y
+
+	for _, point := range v.markPoints[1:] {
+		if point.X < minX {
+			minX = point.X
+		}
+		if point.X > maxX {
+			maxX = point.X
+		}
+		if point.Y < minY {
+			minY = point.Y
+		}
+		if point.Y > maxY {
+			maxY = point.Y
+		}
+	}
+
+	// 向外扩展10像素
+	minX -= 10
+	minY -= 10
+	maxX += 10
+	maxY += 10
+
+	// 确保不超出图像边界
+	if v.image != nil {
+		bounds := v.image.Bounds()
+		if minX < bounds.Min.X {
+			minX = bounds.Min.X
+		}
+		if minY < bounds.Min.Y {
+			minY = bounds.Min.Y
+		}
+		if maxX > bounds.Max.X {
+			maxX = bounds.Max.X
+		}
+		if maxY > bounds.Max.Y {
+			maxY = bounds.Max.Y
+		}
+	}
+
+	// 更新坐标显示框
+	if rectCoordEntry != nil {
+		rectCoordEntry.SetText(fmt.Sprintf("%d,%d,%d,%d", minX, minY, maxX, maxY))
+	}
+}
+
+// 清除所有标记
+func (v *ImageViewer) ClearMarks() {
+	if v.nodeToolOnly {
+		return
+	}
+
+	atomic.AddUint64(&linkedColorPointFlashSeq, 1)
+	linkedColorPointIndex = -1
+	linkedColorPointFlashVisible = false
+
+	v.markPoints = v.markPoints[:0]
+	v.markRects = v.markRects[:0]
+	v.findTestRects = v.findTestRects[:0]
+	v.linkedPointRects = v.linkedPointRects[:0]
+	v.nodeOverlayRects = v.nodeOverlayRects[:0]
+	v.nodeSelectedRects = v.nodeSelectedRects[:0]
+
+	// 重置手动框选标志
+	v.manualRectSelected = false
+
+	// 清空颜色点列表
+	colorPoints = colorPoints[:0]
+
+	// 使用fyne.Do确保在主线程中更新UI
+	fyne.Do(func() {
+		// 清空坐标显示框
+		setRectCoordText(defaultRangeText)
+
+		// 刷新表格显示
+		if refreshColorList != nil {
+			refreshColorList()
+		}
+
+		v.Refresh()
+	})
+}
+
+// 设置左键按下回调函数
+func (v *ImageViewer) SetOnMouseDown(callback func(x, y int)) {
+	v.onMouseDown = callback
+}
+
+// 设置左键弹起回调函数
+func (v *ImageViewer) SetOnMouseUp(callback func(x, y int)) {
+	v.onMouseUp = callback
+}
+
+// 设置右键点击回调函数
+func (v *ImageViewer) SetOnRightClick(callback func(x, y int)) {
+	v.onRightClick = callback
+}
+
+func (v *ImageViewer) SetRangeSelectMode(enabled bool) {
+	if v.nodeToolOnly && enabled {
+		return
+	}
+
+	if v.rangeSelectMode == enabled {
+		return
+	}
+	v.rangeSelectMode = enabled
+	if !enabled {
+		v.tempRect = nil
+		v.dragMode = imageDragNone
+		v.onRangeSelected = nil
+	}
+	if v.onRangeModeChanged != nil {
+		v.onRangeModeChanged(enabled)
+	}
+	v.Refresh()
+}
+
+func (v *ImageViewer) SetRangeSelectModeWithCallback(callback func(image.Rectangle)) {
+	if v.nodeToolOnly {
+		return
+	}
+
+	v.onRangeSelected = callback
+	v.SetRangeSelectMode(true)
+}
+
+func (v *ImageViewer) hideContextMenu() {
+	if v.contextMenu == nil {
+		return
+	}
+	v.contextMenu = nil
+	v.Refresh()
+}
+
+func (v *ImageViewer) currentZoomScale() float32 {
+	if v.zoomScale <= 0 {
+		return 1
+	}
+	return v.zoomScale
+}
+
+func (v *ImageViewer) imagePositionFromView(pos fyne.Position) (int, int, bool) {
+	if v.image == nil {
+		return 0, 0, false
+	}
+
+	scale := v.currentZoomScale()
+	bounds := v.image.Bounds()
+	x := bounds.Min.X + int(pos.X/scale)
+	y := bounds.Min.Y + int(pos.Y/scale)
+	return v.clampImagePosition(x, y)
+}
+
+func (v *ImageViewer) clampImagePosition(x, y int) (int, int, bool) {
+	if v.image == nil {
+		return 0, 0, false
+	}
+
+	bounds := v.image.Bounds()
+	if x < bounds.Min.X {
+		x = bounds.Min.X
+	}
+	if x >= bounds.Max.X {
+		x = bounds.Max.X - 1
+	}
+	if y < bounds.Min.Y {
+		y = bounds.Min.Y
+	}
+	if y >= bounds.Max.Y {
+		y = bounds.Max.Y - 1
+	}
+	return x, y, true
+}
+
+func (v *ImageViewer) addPointAt(x, y int) {
+	if v.nodeToolOnly {
+		return
+	}
+
+	if v.getGridParams != nil {
+		cols, rows, spacing, hasParams := v.getGridParams()
+		if hasParams && cols > 0 && rows > 0 && spacing > 0 {
+			v.AddGridPoints(x, y, cols, rows, spacing)
+			return
+		}
+	}
+	v.AddPoint(x, y, nil)
+}
+
+func (v *ImageViewer) panBy(delta fyne.Position) {
+	if v.scrollContainer == nil {
+		return
+	}
+
+	offset := v.scrollContainer.Offset
+	v.scrollContainer.ScrollToOffset(fyne.NewPos(offset.X-delta.X, offset.Y-delta.Y))
+}
+
+func (v *ImageViewer) applyZoom(scale float32) {
+	if v.image == nil {
+		return
+	}
+	if scale < minImageZoom {
+		scale = minImageZoom
+	}
+	if scale > imageViewerMaxZoom {
+		scale = imageViewerMaxZoom
+	}
+	v.zoomScale = scale
+	v.Refresh()
+	if v.scrollContainer != nil {
+		// The scroll container clamps offsets using Content.Size(). Refreshing
+		// alone does not relayout the top-left content wrapper, so resize it to
+		// the viewer's new MinSize before changing the offset. This makes the
+		// first Ctrl+wheel event effective and keeps the bars synchronized.
+		if content := v.scrollContainer.Content; content != nil {
+			content.Resize(content.MinSize())
+		}
+		v.scrollContainer.Refresh()
+		v.scrollContainer.ScrollToOffset(fyne.NewPos(0, 0))
+	}
+}
+
+func (v *ImageViewer) FitToView() {
+	if v.image == nil || v.scrollContainer == nil {
+		return
+	}
+
+	bounds := v.image.Bounds()
+	imgW := float32(bounds.Dx())
+	imgH := float32(bounds.Dy())
+	viewSize := v.scrollContainer.Size()
+	if imgW <= 0 || imgH <= 0 || viewSize.Width <= 0 || viewSize.Height <= 0 {
+		return
+	}
+
+	scale := fyne.Min(viewSize.Width/imgW, viewSize.Height/imgH)
+	if scale > 1 {
+		scale = 1
+	}
+	v.applyZoom(scale)
+}
+
+func (v *ImageViewer) ShowOriginalSize() {
+	v.applyZoom(1)
+}
+
+func (v *ImageViewer) ResetRangeSelection() {
+	if v.nodeToolOnly {
+		return
+	}
+
+	v.markRects = v.markRects[:0]
+	v.manualRectSelected = false
+	v.tempRect = nil
+	v.SetRangeSelectMode(false)
+	setRectCoordText(defaultRangeText)
+	v.Refresh()
+}
+
+func (v *ImageViewer) zoomAt(pos fyne.Position, zoomIn bool) {
+	if v.image == nil {
+		return
+	}
+
+	oldScale := v.currentZoomScale()
+	newScale := nextImageZoomLevel(oldScale, zoomIn)
+	if newScale == oldScale {
+		return
+	}
+
+	scrollOffset := fyne.NewPos(0, 0)
+	if v.scrollContainer != nil {
+		scrollOffset = v.scrollContainer.Offset
+	}
+	// e.Position 是相对于 ImageViewer 的坐标，同时保留 ImageViewer
+	// 在内容中的位置，确保滚动和缩放使用同一套坐标系。
+	imageOrigin := v.Position()
+	viewPos := imageOrigin.Add(pos).Subtract(scrollOffset)
+	imageX := pos.X / oldScale
+	imageY := pos.Y / oldScale
+
+	// 一次滚轮只提交一次缩放，避免每一帧重新生成整张图片纹理造成卡顿。
+	v.zoomScale = newScale
+	v.Refresh()
+	if v.scrollContainer == nil {
+		return
+	}
+
+	// 先同步内容尺寸，再根据鼠标下的图像点计算新的滚动偏移。
+	// 仅 Refresh 不会立即更新 Scroll.Content.Size()，会导致第一次缩放
+	// 被滚动容器按旧尺寸截断，表现为需要滚轮多次才生效。
+	if content := v.scrollContainer.Content; content != nil {
+		content.Resize(content.MinSize())
+	}
+	v.scrollContainer.Refresh()
+	newImageOrigin := v.Position()
+	v.scrollContainer.ScrollToOffset(fyne.NewPos(
+		newImageOrigin.X+imageX*newScale-viewPos.X,
+		newImageOrigin.Y+imageY*newScale-viewPos.Y,
+	))
+}
+
+// nextImageZoomLevel returns the next fixed zoom level. Zoom is represented as
+// 20%, 40%, ..., 200% of the source image size so every wheel event has a
+// visible and predictable effect.
+func nextImageZoomLevel(current float32, zoomIn bool) float32 {
+	const minLevel = 1.0
+	const maxLevel = float64(imageViewerMaxZoom / zoomLevelStep)
+	level := math.Round(float64(current / zoomLevelStep))
+	if level < minLevel {
+		level = minLevel
+	}
+	if level > maxLevel {
+		level = maxLevel
+	}
+
+	next := level
+	if zoomIn {
+		next++
+	} else {
+		next--
+	}
+
+	scale := float32(next * float64(zoomLevelStep))
+	if scale < float32(minLevel*float64(zoomLevelStep)) {
+		return float32(minLevel * float64(zoomLevelStep))
+	}
+	if scale > imageViewerMaxZoom {
+		return imageViewerMaxZoom
+	}
+	return scale
+}
+
+// 实现MouseDown方法，处理左键按下
+func (v *ImageViewer) MouseDown(e *desktop.MouseEvent) {
+	if v.image == nil || e.Button != desktop.MouseButtonPrimary {
+		return
+	}
+	v.hideContextMenu()
+
+	mouseX, mouseY, ok := v.imagePositionFromView(e.Position)
+	if !ok {
+		return
+	}
+
+	// 记录按下的坐标
+	v.mouseDownX = mouseX
+	v.mouseDownY = mouseY
+	v.lastDragAbs = e.AbsolutePosition
+	v.isDragging = true
+	v.dragMode = imageDragPan
+	if v.rangeSelectMode {
+		v.dragMode = imageDragRange
+	} else if !v.nodeToolOnly && e.Modifier&fyne.KeyModifierControl != 0 {
+		v.dragMode = imageDragPoint
+	}
+
+	// 清除任何现有的临时矩形
+	v.tempRect = nil
+
+	// 鼠标按下时隐藏放大镜
+	if v.magnifier != nil {
+		v.magnifier.Hide()
+	}
+
+	// 调用回调函数
+	if v.onMouseDown != nil {
+		v.onMouseDown(mouseX, mouseY)
+	}
+}
+
+// 实现MouseUp方法，处理左键弹起
+func (v *ImageViewer) MouseUp(e *desktop.MouseEvent) {
+	if v.image == nil || e.Button != desktop.MouseButtonPrimary || !v.isDragging {
+		return
+	}
+
+	mouseX, mouseY, ok := v.imagePositionFromView(e.Position)
+	if !ok {
+		return
+	}
+
+	// 计算按下和弹起位置的距离
+	dist := distance(v.mouseDownX, v.mouseDownY, mouseX, mouseY)
+
+	var rangeSelectedCallback func(image.Rectangle)
+	var selectedRange image.Rectangle
+	switch v.dragMode {
+	case imageDragRange:
+		if dist > 4 && v.tempRect != nil {
+			selectedRange = normalizePickRect(v.image, inclusivePickRect(v.tempRect.X1, v.tempRect.Y1, v.tempRect.X2, v.tempRect.Y2))
+			rangeSelectedCallback = v.onRangeSelected
+			if rangeSelectedCallback == nil {
+				v.AddRect(v.tempRect.X1, v.tempRect.Y1, v.tempRect.X2, v.tempRect.Y2, v.tempRect.Color)
+			}
+		}
+		v.onRangeSelected = nil
+		v.SetRangeSelectMode(false)
+	case imageDragPoint:
+		if dist <= 4 {
+			v.addPointAt(mouseX, mouseY)
+		}
+	}
+
+	// 清除临时矩形
+	v.tempRect = nil
+
+	// 重置拖动状态
+	v.isDragging = false
+	v.dragMode = imageDragNone
+
+	// 鼠标弹起时重新显示放大镜
+	if magnifierEnabled && v.magnifier != nil {
+		v.magnifier.Show()
+	}
+
+	// 刷新视图
+	v.Refresh()
+
+	// 调用回调函数
+	if v.onMouseUp != nil {
+		v.onMouseUp(mouseX, mouseY)
+	}
+	if rangeSelectedCallback != nil && !selectedRange.Empty() {
+		rangeSelectedCallback(selectedRange)
+	}
+}
+
+func (v *ImageViewer) DoubleTapped(e *fyne.PointEvent) {
+	if v.image == nil || v.nodeToolOnly {
+		return
+	}
+
+	mouseX, mouseY, ok := v.imagePositionFromView(e.Position)
+	if !ok {
+		return
+	}
+
+	index := nearestColorPointIndex(colorPoints, mouseX, mouseY, linkedPointHitRadius)
+	if index >= 0 {
+		activateLinkedColorPoint(index)
+	}
+}
+
+// 实现TappedSecondary接口方法，处理右键点击
+func (v *ImageViewer) TappedSecondary(e *fyne.PointEvent) {
+	if v.image == nil || v.window == nil || v.nodeToolOnly {
+		return
+	}
+
+	mouseX, mouseY, ok := v.imagePositionFromView(e.Position)
+	if !ok {
+		return
+	}
+	colorHex, _, _ := colorHexAtImage(v.image, mouseX, mouseY)
+
+	menuContent := container.NewVBox()
+	addMenuButton := func(text string, enabled bool, action func()) {
+		btn := widget.NewButton(text, func() {
+			v.hideContextMenu()
+			action()
+		})
+		if !enabled {
+			btn.Disable()
+		}
+		menuContent.Add(btn)
+	}
+
+	addMenuButton("复制当前坐标", true, func() {
+		v.window.Clipboard().SetContent(fmt.Sprintf("%d, %d", mouseX, mouseY))
+	})
+	addMenuButton("复制当前颜色", true, func() {
+		v.window.Clipboard().SetContent(colorHex)
+	})
+	addMenuButton("清除所有选点", true, func() {
+		v.ClearMarks()
+	})
+	menuContent.Add(widget.NewSeparator())
+
+	for i := 0; i < maxRightMenuPoints; i++ {
+		index := i
+		addMenuButton(fmt.Sprintf("添加到点%d", index+1), index <= len(colorPoints), func() {
+			setColorPointAt(index, mouseX, mouseY)
+		})
+	}
+	menuSize := fyne.NewSize(170, 300)
+	menuScroll := container.NewVScroll(menuContent)
+	menuScroll.SetMinSize(menuSize)
+	bg := canvas.NewRectangle(theme.BackgroundColor())
+	bg.StrokeColor = theme.ShadowColor()
+	bg.StrokeWidth = 1
+	menu := container.NewStack(bg, menuScroll)
+
+	pos := e.Position
+	viewerSize := v.Size()
+	if pos.X+menuSize.Width > viewerSize.Width {
+		pos.X = viewerSize.Width - menuSize.Width
+	}
+	if pos.Y+menuSize.Height > viewerSize.Height {
+		pos.Y = viewerSize.Height - menuSize.Height
+	}
+	if pos.X < 0 {
+		pos.X = 0
+	}
+	if pos.Y < 0 {
+		pos.Y = 0
+	}
+	menu.Move(pos)
+	menu.Resize(menuSize)
+	v.contextMenu = menu
+	v.Refresh()
+
+	// 调用回调函数
+	if v.onRightClick != nil {
+		v.onRightClick(mouseX, mouseY)
+	}
+}
+
+// 设置图像
+func (v *ImageViewer) SetImage(img image.Image) {
+	v.image = img
+	v.originalImage = img // 保存原始图像
+	v.rotationDegrees = 0 // 重置旋转角度
+	v.zoomScale = 1
+	v.findTestRects = v.findTestRects[:0]
+	v.linkedPointRects = v.linkedPointRects[:0]
+	v.displayImage.Image = img
+	v.Refresh()
+}
+
+// 旋转图像到指定角度
+func (v *ImageViewer) RotateImage(degrees int) {
+	if v.originalImage == nil || v.nodeToolOnly {
+		return
+	}
+
+	// 确保角度在0-359范围内
+	degrees = degrees % 360
+
+	// 如果角度是0，直接使用原图
+	if degrees == 0 {
+		v.image = v.originalImage
+		v.displayImage.Image = v.image
+		v.rotationDegrees = degrees
+		v.Refresh()
+		return
+	}
+
+	// 获取原始图像的尺寸
+	bounds := v.originalImage.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+
+	var rotated *image.NRGBA // 使用NRGBA而不是RGBA
+
+	// 根据角度执行不同的旋转
+	switch degrees {
+	case 90:
+		// 创建新的画布，宽高互换
+		rotated = image.NewNRGBA(image.Rect(0, 0, height, width))
+
+		// 执行90度旋转 (x,y) -> (height-y-1, x)
+		for x := 0; x < width; x++ {
+			for y := 0; y < height; y++ {
+				rotated.Set(height-y-1, x, v.originalImage.At(x, y))
+			}
+		}
+
+	case 180:
+		// 创建新的画布，宽高保持不变
+		rotated = image.NewNRGBA(image.Rect(0, 0, width, height))
+
+		// 执行180度旋转 (x,y) -> (width-x-1, height-y-1)
+		for x := 0; x < width; x++ {
+			for y := 0; y < height; y++ {
+				rotated.Set(width-x-1, height-y-1, v.originalImage.At(x, y))
+			}
+		}
+
+	case 270:
+		// 创建新的画布，宽高互换
+		rotated = image.NewNRGBA(image.Rect(0, 0, height, width))
+
+		// 执行270度旋转 (x,y) -> (y, width-x-1)
+		for x := 0; x < width; x++ {
+			for y := 0; y < height; y++ {
+				rotated.Set(y, width-x-1, v.originalImage.At(x, y))
+			}
+		}
+	}
+
+	v.image = rotated
+	v.displayImage.Image = rotated
+	v.rotationDegrees = degrees
+
+	// 清除所有绘制的标记
+	v.ClearMarks()
+
+	v.Refresh()
+}
+
+// 实现CreateRenderer方法
+func (v *ImageViewer) CreateRenderer() fyne.WidgetRenderer {
+	// 创建一个透明的临时矩形对象
+	tempRectObj := canvas.NewRectangle(color.RGBA{255, 0, 0, 255})
+	tempRectObj.StrokeWidth = 1
+	tempRectObj.StrokeColor = color.RGBA{255, 0, 0, 255}
+	tempRectObj.FillColor = color.RGBA{0, 0, 0, 0} // 透明填充
+	tempRectObj.Hide()                             // 初始时隐藏
+
+	return &imageViewerRenderer{
+		viewer:        v,
+		objects:       []fyne.CanvasObject{v.displayImage, tempRectObj},
+		points:        []fyne.CanvasObject{},
+		rects:         []fyne.CanvasObject{},
+		findTestRects: []fyne.CanvasObject{},
+		linkedRects:   []fyne.CanvasObject{},
+		nodeRects:     []fyne.CanvasObject{},
+		nodeSelected:  []fyne.CanvasObject{},
+		tempRect:      tempRectObj,
+	}
+}
+
+// 处理鼠标移动事件
+func (v *ImageViewer) MouseMoved(e *desktop.MouseEvent) {
+	if v.image == nil {
+		return
+	}
+
+	mouseX, mouseY, ok := v.imagePositionFromView(e.Position)
+	if !ok {
+		return
+	}
+
+	// 检测鼠标是否真的移动了（避免滚动导致的坐标变化）
+	mouseMoved := (mouseX != v.lastMouseX || mouseY != v.lastMouseY)
+
+	// 更新上次鼠标位置
+	v.lastMouseX = mouseX
+	v.lastMouseY = mouseY
+
+	if v.isDragging && v.dragMode == imageDragPan {
+		delta := e.AbsolutePosition.Subtract(v.lastDragAbs)
+		v.panBy(delta)
+		v.lastDragAbs = e.AbsolutePosition
+	}
+
+	// 范围模式拖动时更新临时矩形
+	if v.isDragging && v.dragMode == imageDragRange {
+		// 更新或创建临时矩形
+		if v.tempRect == nil {
+			v.tempRect = &MarkRect{
+				X1:    v.mouseDownX,
+				Y1:    v.mouseDownY,
+				X2:    mouseX,
+				Y2:    mouseY,
+				Color: color.RGBA{255, 0, 0, 255}, // 红色
+			}
+		} else {
+			// 更新临时矩形的终点
+			v.tempRect.X2 = mouseX
+			v.tempRect.Y2 = mouseY
+		}
+
+		// 刷新视图以更新临时矩形的显示
+		v.Refresh()
+	}
+
+	// 更新放大镜（不在拖动状态时）
+	if !v.isDragging && magnifierEnabled && v.magnifier != nil && v.scrollContainer != nil {
+		// mouseX, mouseY 是相对于ImageViewer的坐标（图像坐标）
+		// 需要转换为相对于可见窗口的坐标
+		scrollOffset := v.scrollContainer.Offset
+		scale := v.currentZoomScale()
+		bounds := v.image.Bounds()
+		imageOrigin := v.Position()
+		viewX := imageOrigin.X + float32(mouseX-bounds.Min.X)*scale - scrollOffset.X
+		viewY := imageOrigin.Y + float32(mouseY-bounds.Min.Y)*scale - scrollOffset.Y
+
+		// 检查图像坐标是否在范围内
+		imgBounds := v.image.Bounds()
+		if mouseX >= imgBounds.Min.X && mouseX < imgBounds.Max.X &&
+			mouseY >= imgBounds.Min.Y && mouseY < imgBounds.Max.Y {
+			// 更新放大镜，传递图像坐标和可见窗口坐标
+			v.magnifier.Update(v.image, mouseX, mouseY, viewX, viewY)
+		} else {
+			v.magnifier.Hide()
+		}
+	}
+
+	// 调用回调函数（如果有）
+	if mouseMoved && v.onMouseMove != nil {
+		v.onMouseMove(mouseX, mouseY)
+	}
+}
+
+// 实现桌面光标接口的其他方法
+func (v *ImageViewer) MouseIn(*desktop.MouseEvent) {
+	v.mouseInWidget = true
+	if v.window != nil {
+		v.window.Canvas().Focus(v)
+	}
+	if magnifierEnabled && v.magnifier != nil && v.image != nil {
+		v.magnifier.Show()
+	}
+}
+
+func (v *ImageViewer) MouseOut() {
+	v.mouseInWidget = false
+	v.ctrlHeld = false
+	if v.magnifier != nil && !v.isDragging {
+		v.magnifier.Hide()
+	}
+}
+
+// 实现 Focusable 接口
+func (v *ImageViewer) FocusGained()     {}
+func (v *ImageViewer) FocusLost()       {}
+func (v *ImageViewer) TypedRune(r rune) {}
+
+// KeyDown/KeyUp preserve the Ctrl state for wheel events. Some Windows
+// drivers deliver a wheel event before CurrentKeyModifiers has caught up;
+// relying on the driver snapshot alone can make alternating zoom directions
+// appear to stop until Ctrl is released and pressed again.
+func (v *ImageViewer) KeyDown(key *fyne.KeyEvent) {
+	if key != nil && (key.Name == desktop.KeyControlLeft || key.Name == desktop.KeyControlRight) {
+		v.ctrlHeld = true
+	}
+}
+
+func (v *ImageViewer) KeyUp(key *fyne.KeyEvent) {
+	if key != nil && (key.Name == desktop.KeyControlLeft || key.Name == desktop.KeyControlRight) {
+		v.ctrlHeld = false
+	}
+}
+
+// 处理键盘按键事件
+func (v *ImageViewer) TypedKey(key *fyne.KeyEvent) {
+	if v.image == nil || v.window == nil || v.nodeToolOnly {
+		return
+	}
+
+	// 如果 lastMouseX 和 lastMouseY 还没有初始化，使用图像中心作为起始位置
+	if v.lastMouseX < 0 || v.lastMouseY < 0 {
+		bounds := v.image.Bounds()
+		v.lastMouseX = (bounds.Min.X + bounds.Max.X) / 2
+		v.lastMouseY = (bounds.Min.Y + bounds.Max.Y) / 2
+	}
+
+	// 定义移动步长（像素）
+	step := 1
+
+	// 根据按键方向计算新的图像坐标
+	newX := v.lastMouseX
+	newY := v.lastMouseY
+
+	switch key.Name {
+	case fyne.KeyUp:
+		newY -= step
+	case fyne.KeyDown:
+		newY += step
+	case fyne.KeyLeft:
+		newX -= step
+	case fyne.KeyRight:
+		newX += step
+	case fyne.KeySpace:
+		// 按空格键取当前鼠标位置的单个点
+		if v.lastMouseX >= 0 && v.lastMouseY >= 0 {
+			// 确保坐标在图像范围内
+			bounds := v.image.Bounds()
+			mouseX := v.lastMouseX
+			mouseY := v.lastMouseY
+			if mouseX < bounds.Min.X {
+				mouseX = bounds.Min.X
+			}
+			if mouseX >= bounds.Max.X {
+				mouseX = bounds.Max.X - 1
+			}
+			if mouseY < bounds.Min.Y {
+				mouseY = bounds.Min.Y
+			}
+			if mouseY >= bounds.Max.Y {
+				mouseY = bounds.Max.Y - 1
+			}
+			// 添加点（使用nil表示需要计算高对比度颜色）
+			v.AddPoint(mouseX, mouseY, nil)
+		}
+		return // 空格键处理完毕，直接返回
+	case fyne.KeyReturn, fyne.KeyEnter:
+		// 按回车键触发生成按钮
+		if triggerGenerateCode != nil {
+			triggerGenerateCode()
+		}
+		return // 回车键处理完毕，直接返回
+	default:
+		return // 不是方向键、空格键或回车键，直接返回
+	}
+
+	// 限制坐标在图像范围内
+	bounds := v.image.Bounds()
+	if newX < bounds.Min.X {
+		newX = bounds.Min.X
+	}
+	if newX >= bounds.Max.X {
+		newX = bounds.Max.X - 1
+	}
+	if newY < bounds.Min.Y {
+		newY = bounds.Min.Y
+	}
+	if newY >= bounds.Max.Y {
+		newY = bounds.Max.Y - 1
+	}
+
+	// 计算相对移动量（相对于当前鼠标位置）
+	deltaX := float64(newX - v.lastMouseX)
+	deltaY := float64(newY - v.lastMouseY)
+
+	// 更新内部状态
+	v.lastMouseX = newX
+	v.lastMouseY = newY
+
+	// 相对移动系统鼠标光标
+	// 注意：这里的 deltaX 和 deltaY 是像素级别的移动
+	if deltaX != 0 || deltaY != 0 {
+		moveMouseRelative(deltaX, deltaY)
+	}
+
+	// 主动更新放大镜（因为移动鼠标可能不会触发MouseMoved事件）
+	if magnifierEnabled && v.magnifier != nil && v.scrollContainer != nil {
+		// 计算相对于可见窗口的坐标
+		scrollOffset := v.scrollContainer.Offset
+		scale := v.currentZoomScale()
+		bounds := v.image.Bounds()
+		imageOrigin := v.Position()
+		viewX := imageOrigin.X + float32(newX-bounds.Min.X)*scale - scrollOffset.X
+		viewY := imageOrigin.Y + float32(newY-bounds.Min.Y)*scale - scrollOffset.Y
+
+		// 更新放大镜
+		v.magnifier.Update(v.image, newX, newY, viewX, viewY)
+	}
+}
+
+func (v *ImageViewer) CursorType() desktop.Cursor {
+	return desktop.CrosshairCursor
+}
+
+// 获取图像尺寸
+func (v *ImageViewer) ImageSize() (int, int) {
+	if v.image == nil {
+		return 0, 0
+	}
+	bounds := v.image.Bounds()
+	return bounds.Max.X - bounds.Min.X, bounds.Max.Y - bounds.Min.Y
+}
+
+// 图像查看器渲染器
+type imageViewerRenderer struct {
+	viewer        *ImageViewer
+	objects       []fyne.CanvasObject
+	points        []fyne.CanvasObject // 用于绘制点的对象
+	rects         []fyne.CanvasObject // 用于绘制矩形的对象
+	findTestRects []fyne.CanvasObject // 用于绘制找色测试结果高亮框的对象
+	linkedRects   []fyne.CanvasObject // 用于绘制图像点和列表联动高亮框的对象
+	nodeRects     []fyne.CanvasObject // 用于绘制节点工具全部节点框的对象
+	nodeSelected  []fyne.CanvasObject // 用于绘制节点工具选中节点框的对象
+	tempRect      fyne.CanvasObject   // 用于绘制临时矩形的对象
+}
+
+func (r *imageViewerRenderer) MinSize() fyne.Size {
+	if r.viewer.image == nil {
+		return fyne.NewSize(0, 0)
+	}
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	return fyne.NewSize(
+		float32(bounds.Max.X-bounds.Min.X)*scale,
+		float32(bounds.Max.Y-bounds.Min.Y)*scale,
+	)
+}
+
+func (r *imageViewerRenderer) Layout(size fyne.Size) {
+	r.viewer.displayImage.Resize(size)
+
+	// 调整点标记的位置
+	r.updatePointsLayout()
+
+	// 调整矩形标记的位置
+	r.updateRectsLayout()
+
+	// 调整找色测试高亮框的位置
+	r.updateFindTestRectsLayout()
+
+	// 调整图像点和列表联动高亮框的位置
+	r.updateLinkedRectsLayout()
+
+	// 调整节点工具覆盖框的位置
+	r.updateNodeRectsLayout()
+	r.updateNodeSelectedLayout()
+}
+
+func (r *imageViewerRenderer) Refresh() {
+	r.viewer.displayImage.Refresh()
+
+	// 更新点标记和矩形标记
+	r.updatePoints()
+	r.updateRects()
+	r.updateFindTestRects()
+	r.updateLinkedRects()
+	r.updateNodeRects()
+	r.updateNodeSelectedRects()
+	r.updateTempRect() // 更新临时矩形
+
+	// 确保我们有所有的对象
+	allObjects := []fyne.CanvasObject{r.viewer.displayImage, r.tempRect}
+	allObjects = append(allObjects, r.points...)
+	allObjects = append(allObjects, r.rects...)
+	allObjects = append(allObjects, r.nodeRects...)
+	allObjects = append(allObjects, r.linkedRects...)
+	allObjects = append(allObjects, r.nodeSelected...)
+	allObjects = append(allObjects, r.findTestRects...)
+	if r.viewer.contextMenu != nil {
+		allObjects = append(allObjects, r.viewer.contextMenu)
+	}
+	r.objects = allObjects
+
+	// 强制刷新所有点和矩形的大小和位置
+	r.updatePointsLayout()
+	r.updateRectsLayout()
+	r.updateFindTestRectsLayout()
+	r.updateLinkedRectsLayout()
+	r.updateNodeRectsLayout()
+	r.updateNodeSelectedLayout()
+
+	// 刷新所有点和矩形
+	for _, p := range r.points {
+		p.Refresh()
+	}
+	for _, rect := range r.rects {
+		rect.Refresh()
+	}
+	for _, rect := range r.findTestRects {
+		rect.Refresh()
+	}
+	for _, rect := range r.linkedRects {
+		rect.Refresh()
+	}
+	for _, rect := range r.nodeRects {
+		rect.Refresh()
+	}
+	for _, rect := range r.nodeSelected {
+		rect.Refresh()
+	}
+	r.tempRect.Refresh()
+}
+
+// 更新点标记的位置
+func (r *imageViewerRenderer) updatePointsLayout() {
+	// 如果没有图像，不做任何事
+	if r.viewer.image == nil {
+		return
+	}
+
+	// 遍历所有点对象并调整它们的位置和大小
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	pointSize := float32(2) * scale
+	if pointSize < 2 {
+		pointSize = 2
+	}
+	for i, p := range r.points {
+		if i < len(r.viewer.markPoints) {
+			point := r.viewer.markPoints[i]
+			p.Resize(fyne.NewSize(pointSize, pointSize))
+			// 移动点到正确的位置
+			p.Move(fyne.NewPos(float32(point.X-bounds.Min.X)*scale, float32(point.Y-bounds.Min.Y)*scale))
+		}
+	}
+}
+
+// 更新矩形标记的位置
+func (r *imageViewerRenderer) updateRectsLayout() {
+	// 如果没有图像，不做任何事
+	if r.viewer.image == nil {
+		return
+	}
+
+	// 遍历所有矩形对象并调整它们的位置和大小
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for i, rect := range r.rects {
+		if i < len(r.viewer.markRects) {
+			markRect := r.viewer.markRects[i]
+
+			// 计算矩形的位置和尺寸
+			x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+			y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+			width := float32(abs(markRect.X2-markRect.X1)) * scale
+			height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+			// 确保宽高至少为1
+			if width < 1 {
+				width = 1
+			}
+			if height < 1 {
+				height = 1
+			}
+
+			// 移动和调整矩形大小
+			rect.Move(fyne.NewPos(x, y))
+			rect.Resize(fyne.NewSize(width, height))
+		}
+	}
+}
+
+func (r *imageViewerRenderer) updateFindTestRectsLayout() {
+	// 如果没有图像，不做任何事
+	if r.viewer.image == nil {
+		return
+	}
+
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for i, rect := range r.findTestRects {
+		if i < len(r.viewer.findTestRects) {
+			markRect := r.viewer.findTestRects[i]
+
+			x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+			y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+			width := float32(abs(markRect.X2-markRect.X1)) * scale
+			height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+			if width < 1 {
+				width = 1
+			}
+			if height < 1 {
+				height = 1
+			}
+
+			rect.Move(fyne.NewPos(x, y))
+			rect.Resize(fyne.NewSize(width, height))
+		}
+	}
+}
+
+func (r *imageViewerRenderer) updateLinkedRectsLayout() {
+	if r.viewer.image == nil {
+		return
+	}
+
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for i, rect := range r.linkedRects {
+		if i < len(r.viewer.linkedPointRects) {
+			markRect := r.viewer.linkedPointRects[i]
+
+			x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+			y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+			width := float32(abs(markRect.X2-markRect.X1)) * scale
+			height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+			if width < 1 {
+				width = 1
+			}
+			if height < 1 {
+				height = 1
+			}
+
+			rect.Move(fyne.NewPos(x, y))
+			rect.Resize(fyne.NewSize(width, height))
+		}
+	}
+}
+
+func (r *imageViewerRenderer) updateNodeRectsLayout() {
+	r.updateMarkRectObjectsLayout(r.nodeRects, r.viewer.nodeOverlayRects)
+}
+
+func (r *imageViewerRenderer) updateNodeSelectedLayout() {
+	r.updateMarkRectObjectsLayout(r.nodeSelected, r.viewer.nodeSelectedRects)
+}
+
+func (r *imageViewerRenderer) updateMarkRectObjectsLayout(objects []fyne.CanvasObject, markRects []MarkRect) {
+	if r.viewer.image == nil {
+		return
+	}
+
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for i, rect := range objects {
+		if i >= len(markRects) {
+			continue
+		}
+		markRect := markRects[i]
+
+		x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+		y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+		width := float32(abs(markRect.X2-markRect.X1)) * scale
+		height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+		if width < 1 {
+			width = 1
+		}
+		if height < 1 {
+			height = 1
+		}
+
+		rect.Move(fyne.NewPos(x, y))
+		rect.Resize(fyne.NewSize(width, height))
+	}
+}
+
+// 更新点标记（添加新点，移除旧点）
+func (r *imageViewerRenderer) updatePoints() {
+	// 清除现有点
+	r.points = make([]fyne.CanvasObject, 0, len(r.viewer.markPoints))
+
+	// 为每个标记点创建一个2x2像素的方块
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	pointSize := float32(2) * scale
+	if pointSize < 2 {
+		pointSize = 2
+	}
+	for _, point := range r.viewer.markPoints {
+		// 创建2x2的方块，左上角对应点击位置
+		rect := canvas.NewRectangle(point.Color)
+		rect.SetMinSize(fyne.NewSize(pointSize, pointSize))
+		rect.Resize(fyne.NewSize(pointSize, pointSize))
+		rect.Move(fyne.NewPos(float32(point.X-bounds.Min.X)*scale, float32(point.Y-bounds.Min.Y)*scale))
+		r.points = append(r.points, rect)
+	}
+}
+
+// 更新矩形标记（添加新矩形，移除旧矩形）
+func (r *imageViewerRenderer) updateRects() {
+	// 清除现有矩形
+	r.rects = make([]fyne.CanvasObject, 0, len(r.viewer.markRects))
+
+	// 为每个标记矩形创建一个矩形对象
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for _, markRect := range r.viewer.markRects {
+		rect := canvas.NewRectangle(markRect.Color)
+		rect.StrokeWidth = 1
+		rect.StrokeColor = markRect.Color
+		rect.FillColor = color.RGBA{0, 0, 0, 0} // 透明填充
+
+		// 计算矩形的位置和尺寸
+		x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+		y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+		width := float32(abs(markRect.X2-markRect.X1)) * scale
+		height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+		// 确保宽高至少为1
+		if width < 1 {
+			width = 1
+		}
+		if height < 1 {
+			height = 1
+		}
+
+		// 设置矩形的位置和尺寸
+		rect.Move(fyne.NewPos(x, y))
+		rect.Resize(fyne.NewSize(width, height))
+
+		r.rects = append(r.rects, rect)
+	}
+}
+
+func (r *imageViewerRenderer) updateFindTestRects() {
+	r.findTestRects = make([]fyne.CanvasObject, 0, len(r.viewer.findTestRects))
+
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for _, markRect := range r.viewer.findTestRects {
+		rect := canvas.NewRectangle(markRect.Color)
+		rect.StrokeWidth = 2
+		rect.StrokeColor = markRect.Color
+		rect.FillColor = color.RGBA{0, 0, 0, 0}
+
+		x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+		y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+		width := float32(abs(markRect.X2-markRect.X1)) * scale
+		height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+		if width < 1 {
+			width = 1
+		}
+		if height < 1 {
+			height = 1
+		}
+
+		rect.Move(fyne.NewPos(x, y))
+		rect.Resize(fyne.NewSize(width, height))
+
+		r.findTestRects = append(r.findTestRects, rect)
+	}
+}
+
+func (r *imageViewerRenderer) updateLinkedRects() {
+	r.linkedRects = make([]fyne.CanvasObject, 0, len(r.viewer.linkedPointRects))
+
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for _, markRect := range r.viewer.linkedPointRects {
+		rect := canvas.NewRectangle(markRect.Color)
+		rect.StrokeWidth = 3
+		rect.StrokeColor = markRect.Color
+		rect.FillColor = color.RGBA{0, 0, 0, 0}
+
+		x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+		y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+		width := float32(abs(markRect.X2-markRect.X1)) * scale
+		height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+		if width < 1 {
+			width = 1
+		}
+		if height < 1 {
+			height = 1
+		}
+
+		rect.Move(fyne.NewPos(x, y))
+		rect.Resize(fyne.NewSize(width, height))
+
+		r.linkedRects = append(r.linkedRects, rect)
+	}
+}
+
+func (r *imageViewerRenderer) updateNodeRects() {
+	r.nodeRects = r.markRectCanvasObjects(r.viewer.nodeOverlayRects, 1)
+}
+
+func (r *imageViewerRenderer) updateNodeSelectedRects() {
+	r.nodeSelected = r.markRectCanvasObjects(r.viewer.nodeSelectedRects, 3)
+}
+
+func (r *imageViewerRenderer) markRectCanvasObjects(markRects []MarkRect, strokeWidth float32) []fyne.CanvasObject {
+	if r.viewer.image == nil {
+		return nil
+	}
+
+	objects := make([]fyne.CanvasObject, 0, len(markRects))
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	for _, markRect := range markRects {
+		rect := canvas.NewRectangle(markRect.Color)
+		rect.StrokeWidth = strokeWidth
+		rect.StrokeColor = markRect.Color
+		rect.FillColor = color.RGBA{0, 0, 0, 0}
+
+		x := float32(min(markRect.X1, markRect.X2)-bounds.Min.X) * scale
+		y := float32(min(markRect.Y1, markRect.Y2)-bounds.Min.Y) * scale
+		width := float32(abs(markRect.X2-markRect.X1)) * scale
+		height := float32(abs(markRect.Y2-markRect.Y1)) * scale
+
+		if width < 1 {
+			width = 1
+		}
+		if height < 1 {
+			height = 1
+		}
+
+		rect.Move(fyne.NewPos(x, y))
+		rect.Resize(fyne.NewSize(width, height))
+		objects = append(objects, rect)
+	}
+	return objects
+}
+
+// 更新临时矩形
+func (r *imageViewerRenderer) updateTempRect() {
+	// 如果没有临时矩形数据，则隐藏临时矩形对象
+	if r.viewer.tempRect == nil {
+		r.tempRect.Hide()
+		return
+	}
+
+	// 显示临时矩形
+	r.tempRect.Show()
+
+	// 获取临时矩形数据
+	tempRect := r.viewer.tempRect
+
+	// 计算矩形的位置和尺寸
+	bounds := r.viewer.image.Bounds()
+	scale := r.viewer.currentZoomScale()
+	x := float32(min(tempRect.X1, tempRect.X2)-bounds.Min.X) * scale
+	y := float32(min(tempRect.Y1, tempRect.Y2)-bounds.Min.Y) * scale
+	width := float32(abs(tempRect.X2-tempRect.X1)) * scale
+	height := float32(abs(tempRect.Y2-tempRect.Y1)) * scale
+
+	// 确保宽高至少为1
+	if width < 1 {
+		width = 1
+	}
+	if height < 1 {
+		height = 1
+	}
+
+	// 移动和调整矩形大小
+	rect := r.tempRect.(*canvas.Rectangle)
+	rect.Move(fyne.NewPos(x, y))
+	rect.Resize(fyne.NewSize(width, height))
+}
+
+// 辅助函数：计算两点之间的欧几里得距离
+func distance(x1, y1, x2, y2 int) float64 {
+	dx := float64(x2 - x1)
+	dy := float64(y2 - y1)
+	return math.Sqrt(dx*dx + dy*dy)
+}
+
+// 辅助函数：取两个数中的最小值
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// 辅助函数：取绝对值
+func abs(a int) int {
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+
+func (r *imageViewerRenderer) Objects() []fyne.CanvasObject {
+	// 确保所有点对象和矩形对象都包含在返回的切片中
+	return r.objects
+}
+
+func (r *imageViewerRenderer) Destroy() {}
+
+// 计算颜色的反色（使用增强的反色算法）
+func getInverseColor(c color.Color) color.Color {
+	// 转换为RGBA
+	r, g, b, a := c.RGBA()
+
+	// 转换到0-255范围
+	r8 := uint8(r >> 8)
+	g8 := uint8(g >> 8)
+	b8 := uint8(b >> 8)
+	a8 := uint8(a >> 8)
+
+	// 使用增强的反色算法
+	adjust := func(value uint8) uint8 {
+		normalized := float64(value) / 255.0
+		if normalized < 0.5 {
+			normalized = normalized * normalized // 增强低值区域
+		} else {
+			normalized = 1 - (1-normalized)*(1-normalized) // 增强高值区域
+		}
+		return uint8((1 - normalized) * 255) // 取反并返回
+	}
+
+	invR := adjust(r8)
+	invG := adjust(g8)
+	invB := adjust(b8)
+
+	return color.RGBA{invR, invG, invB, a8}
+}
+
+// 检查颜色是否接近中间灰色
+func isNearMidGray(r, g, b uint8) bool {
+	// 计算与中间灰色(127,127,127)的差距
+	const midGray = 127
+	const threshold = 30 // 阈值，可以调整
+
+	rDiff := abs(int(r) - midGray)
+	gDiff := abs(int(g) - midGray)
+	bDiff := abs(int(b) - midGray)
+
+	// 如果RGB三个通道都接近中间值，且彼此接近，则认为是接近中间灰色
+	avgDiff := (rDiff + gDiff + bDiff) / 3
+	maxDiff := max(max(rDiff, gDiff), bDiff)
+
+	return avgDiff < threshold && maxDiff < threshold*1.5
+}
+
+// 计算颜色亮度
+func getBrightness(r, g, b uint8) uint8 {
+	// 使用感知亮度公式: 0.299*R + 0.587*G + 0.114*B
+	return uint8(0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b))
+}
+
+// 取两个数中的较大值
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// 创建新的图像查看器
+func NewImageViewer() *ImageViewer {
+	viewer := &ImageViewer{
+		displayImage:      canvas.NewImageFromImage(nil),
+		markPoints:        make([]MarkPoint, 0),
+		markRects:         make([]MarkRect, 0),
+		findTestRects:     make([]MarkRect, 0),
+		linkedPointRects:  make([]MarkRect, 0),
+		nodeOverlayRects:  make([]MarkRect, 0),
+		nodeSelectedRects: make([]MarkRect, 0),
+		tempRect:          nil, // 初始化为nil，表示没有临时矩形
+		rotationDegrees:   0,   // 初始化旋转角度为0
+		zoomScale:         1,
+		lastMouseX:        -1, // 初始化为-1，确保第一次移动会被检测到
+		lastMouseY:        -1,
+		onMouseMove: func(x, y int) {
+			//fmt.Printf("鼠标移动: X=%d, Y=%d\n", x, y)
+		},
+		onMouseDown: func(x, y int) {
+			//fmt.Printf("左键按下: X=%d, Y=%d\n", x, y)
+		},
+		onMouseUp: func(x, y int) {
+			//fmt.Printf("左键弹起: X=%d, Y=%d\n", x, y)
+		},
+		onRightClick: func(x, y int) {
+			//fmt.Printf("右键点击: X=%d, Y=%d\n", x, y)
+		},
+	}
+	viewer.displayImage.FillMode = canvas.ImageFillContain
+	// 滚轮缩放时优先使用 GPU/双线性快速缩放，避免默认 Catmull-Rom
+	// 在每次尺寸变化时重新计算整张大图造成明显卡顿。
+	viewer.displayImage.ScaleMode = canvas.ImageScaleFastest
+	viewer.ExtendBaseWidget(viewer)
+	return viewer
+}
+
+// 添加点标记
+func (v *ImageViewer) AddPoint(x, y int, c color.Color) {
+	if v.nodeToolOnly {
+		return
+	}
+
+	// 如果提供了颜色，使用提供的颜色
+	// 如果没有提供颜色（nil）且有图像，则根据背景亮度选择高对比度颜色
+	markColor := c
+	var originalColor color.Color // 存储原始颜色
+
+	if c == nil && v.image != nil {
+		// 确保坐标在图像范围内
+		bounds := v.image.Bounds()
+		if x >= bounds.Min.X && x < bounds.Max.X && y >= bounds.Min.Y && y < bounds.Max.Y {
+			// 获取图像中该点的颜色
+			pixelColor := v.image.At(x, y)
+			originalColor = pixelColor // 保存原始颜色
+
+			// 使用反色作为标记颜色
+			markColor = getInverseColor(pixelColor)
+		} else {
+			// 如果坐标超出范围，使用默认黑色的反色（白色）
+			originalColor = color.RGBA{0, 0, 0, 255} // 默认黑色
+			markColor = getInverseColor(originalColor)
+		}
+	} else {
+		originalColor = color.RGBA{0, 0, 0, 255} // 默认黑色
+	}
+
+	v.markPoints = append(v.markPoints, MarkPoint{X: x, Y: y, Color: markColor})
+
+	// 获取原始颜色的十六进制表示
+	r, g, b, _ := originalColor.RGBA()
+	r8, g8, b8 := uint8(r>>8), uint8(g>>8), uint8(b>>8)
+	hexColor := fmt.Sprintf("#%02X%02X%02X", r8, g8, b8)
+
+	// 将点的信息添加到颜色点列表中，使用原始颜色
+	addColorPointToList(x, y, hexColor, true)
+
+	// 更新区域包围盒
+	v.updateBoundingBox()
+
+	v.Refresh() // 刷新视图以显示新点
+}
+
+func colorPointFromImage(img image.Image, p image.Point) (MarkPoint, ColorPoint, bool) {
+	hexColor, pixelColor, ok := colorHexAtImage(img, p.X, p.Y)
+	if !ok {
+		return MarkPoint{}, ColorPoint{}, false
+	}
+
+	return MarkPoint{
+			X:     p.X,
+			Y:     p.Y,
+			Color: getInverseColor(pixelColor),
+		}, ColorPoint{
+			Position: fmt.Sprintf("%d, %d", p.X, p.Y),
+			Color:    hexColor,
+			Offset:   defaultColorPointOffset,
+			Selected: true,
+		}, true
+}
+
+func (v *ImageViewer) AddPoints(points []image.Point) {
+	v.addPoints(points, false)
+}
+
+func (v *ImageViewer) ReplacePoints(points []image.Point) {
+	v.addPoints(points, true)
+}
+
+func (v *ImageViewer) addPoints(points []image.Point, clearExisting bool) {
+	if v.image == nil || len(points) == 0 || v.nodeToolOnly {
+		return
+	}
+
+	if clearExisting {
+		atomic.AddUint64(&linkedColorPointFlashSeq, 1)
+		linkedColorPointIndex = -1
+		linkedColorPointFlashVisible = false
+		v.markPoints = v.markPoints[:0]
+		colorPoints = colorPoints[:0]
+	}
+
+	added := 0
+	for _, point := range points {
+		mark, item, ok := colorPointFromImage(v.image, point)
+		if !ok {
+			continue
+		}
+
+		item.ID = len(colorPoints)
+		v.markPoints = append(v.markPoints, mark)
+		colorPoints = append(colorPoints, item)
+		added++
+	}
+	if added == 0 {
+		return
+	}
+
+	v.updateBoundingBox()
+	if refreshColorList != nil {
+		refreshColorList()
+	}
+	v.Refresh()
+}
+
+// 批量添加NxN点阵的颜色点
+func (v *ImageViewer) AddGridPoints(startX, startY, cols, rows, spacing int) {
+	if v.image == nil || v.nodeToolOnly {
+		return
+	}
+
+	bounds := v.image.Bounds()
+	if cols <= 0 || rows <= 0 || spacing <= 0 {
+		return
+	}
+
+	minCol, maxCol := -(cols / 2), (cols-1)/2
+	minRow, maxRow := -(rows / 2), (rows-1)/2
+	maxRadius := max(max(-minCol, maxCol), max(-minRow, maxRow))
+	for radius := 0; radius <= maxRadius; radius++ {
+		for row := max(minRow, -radius); row <= min(maxRow, radius); row++ {
+			for col := max(minCol, -radius); col <= min(maxCol, radius); col++ {
+				if max(abs(col), abs(row)) != radius {
+					continue
+				}
+				x := startX + col*spacing
+				y := startY + row*spacing
+				if x < bounds.Min.X || x >= bounds.Max.X || y < bounds.Min.Y || y >= bounds.Max.Y {
+					continue
+				}
+
+				pixelColor := v.image.At(x, y)
+				r, g, b, _ := pixelColor.RGBA()
+				hexColor := fmt.Sprintf("#%02X%02X%02X", uint8(r>>8), uint8(g>>8), uint8(b>>8))
+				v.markPoints = append(v.markPoints, MarkPoint{X: x, Y: y, Color: getInverseColor(pixelColor)})
+				addColorPointToList(x, y, hexColor, true)
+			}
+		}
+	}
+
+	// 更新区域包围盒
+	v.updateBoundingBox()
+
+	// 批量添加完成后刷新一次
+	v.Refresh()
+}
+
+// 裁剪图像的辅助函数
+func cropImage(img image.Image, rect image.Rectangle) image.Image {
+	bounds := img.Bounds()
+	croppedRect := image.Rect(0, 0, rect.Dx(), rect.Dy())
+	croppedImg := image.NewNRGBA(croppedRect) // 使用NRGBA而不是RGBA
+
+	// 复制像素
+	for y := rect.Min.Y; y < rect.Max.Y; y++ {
+		for x := rect.Min.X; x < rect.Max.X; x++ {
+			if x >= bounds.Min.X && x < bounds.Max.X && y >= bounds.Min.Y && y < bounds.Max.Y {
+				croppedImg.Set(x-rect.Min.X, y-rect.Min.Y, img.At(x, y))
+			}
+		}
+	}
+
+	return croppedImg
+}
+
+// 将任意图像转换为NRGBA格式
+func convertToNRGBA(src image.Image) *image.NRGBA {
+	// 如果已经是NRGBA，直接返回
+	if nrgba, ok := src.(*image.NRGBA); ok {
+		return nrgba
+	}
+
+	// 创建新的NRGBA图像
+	bounds := src.Bounds()
+	dst := image.NewNRGBA(bounds)
+
+	// 复制像素
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			dst.Set(x, y, src.At(x, y))
+		}
+	}
+
+	return dst
+}
+
+// 放大镜组件
+type MagnifierWidget struct {
+	widget.BaseWidget
+	sourceImage   image.Image
+	gridImage     *image.NRGBA // 使用NRGBA而不是RGBA
+	gridRaster    *canvas.Raster
+	gridSize      int
+	cellSize      int
+	infoText      *canvas.Text
+	background    *canvas.Rectangle
+	visible       bool
+	mouseX        int     // 鼠标在图像中的X坐标（用于取色）
+	mouseY        int     // 鼠标在图像中的Y坐标（用于取色）
+	cursorX       float32 // 鼠标在可见区域中的X坐标（用于定位放大镜）
+	cursorY       float32 // 鼠标在可见区域中的Y坐标（用于定位放大镜）
+	containerSize fyne.Size
+}
+
+// 创建新的放大镜组件
+func NewMagnifierWidget() *MagnifierWidget {
+	m := &MagnifierWidget{
+		gridSize: 15,
+		cellSize: 15,
+		visible:  false,
+	}
+
+	// 创建背景
+	m.background = canvas.NewRectangle(color.NRGBA{40, 40, 40, 230})
+	m.background.StrokeWidth = 2
+	m.background.StrokeColor = color.NRGBA{200, 200, 200, 255}
+
+	// 创建用于绘制网格的图像
+	gridPixelSize := m.gridSize * m.cellSize
+	m.gridImage = image.NewNRGBA(image.Rect(0, 0, gridPixelSize, gridPixelSize)) // 使用NRGBA而不是RGBA
+
+	// 创建Raster来显示网格
+	m.gridRaster = canvas.NewRaster(func(w, h int) image.Image {
+		return m.gridImage
+	})
+	m.gridRaster.ScaleMode = canvas.ImageScalePixels
+
+	// 创建信息文本
+	m.infoText = canvas.NewText("X:0 Y:0 RGB:#000000", color.White)
+	m.infoText.TextSize = 12
+	m.infoText.Alignment = fyne.TextAlignCenter
+
+	// 初始化时隐藏所有元素
+	m.background.Hide()
+	m.gridRaster.Hide()
+	m.infoText.Hide()
+
+	m.ExtendBaseWidget(m)
+	return m
+}
+
+// 快速获取像素颜色（直接访问Pix数组，图像始终是NRGBA）
+func getPixelColorFast(img image.Image, x, y int) (r, g, b uint8) {
+	bounds := img.Bounds()
+	if x < bounds.Min.X || x >= bounds.Max.X || y < bounds.Min.Y || y >= bounds.Max.Y {
+		return 0, 0, 0 // 超出范围返回黑色
+	}
+
+	// 图像始终是NRGBA
+	imgTyped := img.(*image.NRGBA)
+	idx := (y-bounds.Min.Y)*imgTyped.Stride + (x-bounds.Min.X)*4
+	return imgTyped.Pix[idx], imgTyped.Pix[idx+1], imgTyped.Pix[idx+2]
+}
+
+// 更新放大镜显示 - 完全复刻参考代码的逻辑
+func (m *MagnifierWidget) Update(img image.Image, imageX, imageY int, cursorX, cursorY float32) {
+	if !magnifierEnabled {
+		m.Hide()
+		return
+	}
+	if img == nil {
+		return
+	}
+
+	m.sourceImage = img
+	m.mouseX = imageX
+	m.mouseY = imageY
+	m.cursorX = cursorX
+	m.cursorY = cursorY
+	m.visible = true
+
+	halfGrid := m.gridSize / 2
+
+	// 获取中心点颜色并更新信息文本
+	r8, g8, b8 := getPixelColorFast(img, imageX, imageY)
+	colorStr := fmt.Sprintf("#%02X%02X%02X", r8, g8, b8)
+	m.infoText.Text = fmt.Sprintf("X:%d Y:%d RGB:%s", imageX, imageY, colorStr)
+
+	// 绘制网格到图像
+	borderColor := color.RGBA{80, 80, 80, 255}
+
+	for y := 0; y < m.gridSize; y++ {
+		for x := 0; x < m.gridSize; x++ {
+			pixelX := imageX - halfGrid + x
+			pixelY := imageY - halfGrid + y
+
+			// 快速获取像素颜色
+			pr, pg, pb := getPixelColorFast(img, pixelX, pixelY)
+			pixelColor := color.RGBA{pr, pg, pb, 255}
+
+			// 填充格子区域
+			for dy := 0; dy < m.cellSize; dy++ {
+				for dx := 0; dx < m.cellSize; dx++ {
+					imgX := x*m.cellSize + dx
+					imgY := y*m.cellSize + dy
+					gridIdx := imgY*m.gridImage.Stride + imgX*4
+
+					// 绘制格子边框
+					if dx == 0 || dy == 0 {
+						m.gridImage.Pix[gridIdx] = borderColor.R
+						m.gridImage.Pix[gridIdx+1] = borderColor.G
+						m.gridImage.Pix[gridIdx+2] = borderColor.B
+						m.gridImage.Pix[gridIdx+3] = borderColor.A
+					} else {
+						m.gridImage.Pix[gridIdx] = pixelColor.R
+						m.gridImage.Pix[gridIdx+1] = pixelColor.G
+						m.gridImage.Pix[gridIdx+2] = pixelColor.B
+						m.gridImage.Pix[gridIdx+3] = pixelColor.A
+					}
+				}
+			}
+
+			// 中心位置添加特殊标识
+			if x == halfGrid && y == halfGrid {
+				// 使用中心像素的反色作为边框颜色
+				centerColor := color.RGBA{pr, pg, pb, 255}
+				inverseColor := getInverseColor(centerColor)
+				r, g, b, _ := inverseColor.RGBA()
+				borderR, borderG, borderB := uint8(r>>8), uint8(g>>8), uint8(b>>8)
+
+				// 绘制加粗的边框
+				for i := 0; i < m.cellSize; i++ {
+					imgX := x * m.cellSize
+					imgY := y * m.cellSize
+
+					// 顶部和底部
+					for _, dy := range []int{0, 1, m.cellSize - 2, m.cellSize - 1} {
+						idx := (imgY+dy)*m.gridImage.Stride + (imgX+i)*4
+						m.gridImage.Pix[idx] = borderR
+						m.gridImage.Pix[idx+1] = borderG
+						m.gridImage.Pix[idx+2] = borderB
+						m.gridImage.Pix[idx+3] = 255
+					}
+
+					// 左侧和右侧
+					for _, dx := range []int{0, 1, m.cellSize - 2, m.cellSize - 1} {
+						idx := (imgY+i)*m.gridImage.Stride + (imgX+dx)*4
+						m.gridImage.Pix[idx] = borderR
+						m.gridImage.Pix[idx+1] = borderG
+						m.gridImage.Pix[idx+2] = borderB
+						m.gridImage.Pix[idx+3] = 255
+					}
+				}
+			}
+		}
+	}
+
+	m.Refresh()
+}
+
+// 隐藏放大镜
+func (m *MagnifierWidget) Hide() {
+	m.visible = false
+	m.Refresh()
+}
+
+// 显示放大镜
+func (m *MagnifierWidget) Show() {
+	m.visible = true
+	m.Refresh()
+}
+
+// 创建渲染器
+func (m *MagnifierWidget) CreateRenderer() fyne.WidgetRenderer {
+	return &magnifierRenderer{
+		magnifier: m,
+	}
+}
+
+// 放大镜渲染器
+type magnifierRenderer struct {
+	magnifier *MagnifierWidget
+}
+
+func (r *magnifierRenderer) MinSize() fyne.Size {
+	// 不占用空间，因为是浮动在上层的
+	return fyne.NewSize(0, 0)
+}
+
+func (r *magnifierRenderer) Layout(size fyne.Size) {
+	// 保存容器尺寸
+	r.magnifier.containerSize = size
+
+	if !r.magnifier.visible {
+		return
+	}
+
+	// 计算放大镜的尺寸
+	gridWidth := float32(r.magnifier.gridSize * r.magnifier.cellSize)
+	gridHeight := float32(r.magnifier.gridSize * r.magnifier.cellSize)
+	infoHeight := float32(20)
+	totalWidth := gridWidth + 10
+	totalHeight := gridHeight + infoHeight + 15
+
+	// 完全复刻参考代码的逻辑：放大镜位置 = 鼠标位置 + 偏移(20, 20)
+	offsetX := float32(20)
+	offsetY := float32(20)
+
+	posX := r.magnifier.cursorX + offsetX
+	posY := r.magnifier.cursorY + offsetY
+
+	// 边界检查：如果会超出右边界，放到鼠标左边
+	if posX+totalWidth > size.Width {
+		posX = r.magnifier.cursorX - totalWidth - offsetX
+	}
+
+	// 边界检查：如果会超出下边界，放到鼠标上边
+	if posY+totalHeight > size.Height {
+		posY = r.magnifier.cursorY - totalHeight - offsetY
+	}
+
+	// 最终边界保护
+	if posX < 5 {
+		posX = 5
+	}
+	if posY < 5 {
+		posY = 5
+	}
+	if posX+totalWidth > size.Width-5 {
+		posX = size.Width - totalWidth - 5
+	}
+	if posY+totalHeight > size.Height-5 {
+		posY = size.Height - totalHeight - 5
+	}
+
+	// 布局背景
+	r.magnifier.background.Move(fyne.NewPos(posX, posY))
+	r.magnifier.background.Resize(fyne.NewSize(totalWidth, totalHeight))
+
+	// 布局网格（现在在顶部）
+	gridX := posX + 5
+	gridY := posY + 5
+	r.magnifier.gridRaster.Move(fyne.NewPos(gridX, gridY))
+	r.magnifier.gridRaster.Resize(fyne.NewSize(gridWidth, gridHeight))
+
+	// 布局信息文本（现在在底部）
+	infoY := posY + gridHeight + 10
+	r.magnifier.infoText.Move(fyne.NewPos(posX+5, infoY))
+	r.magnifier.infoText.Resize(fyne.NewSize(totalWidth-10, infoHeight))
+}
+
+func (r *magnifierRenderer) Refresh() {
+	if !r.magnifier.visible {
+		r.magnifier.background.Hide()
+		r.magnifier.infoText.Hide()
+		r.magnifier.gridRaster.Hide()
+	} else {
+		// 每次刷新时重新计算位置（跟随鼠标）
+		if r.magnifier.containerSize.Width > 0 && r.magnifier.containerSize.Height > 0 {
+			r.Layout(r.magnifier.containerSize)
+		}
+
+		r.magnifier.background.Show()
+		r.magnifier.infoText.Show()
+		r.magnifier.gridRaster.Show()
+		r.magnifier.gridRaster.Refresh()
+		r.magnifier.infoText.Refresh()
+		r.magnifier.background.Refresh()
+	}
+}
+
+func (r *magnifierRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.magnifier.background, r.magnifier.infoText, r.magnifier.gridRaster}
+}
+
+func (r *magnifierRenderer) Destroy() {}
+
+func main() {
+	userConfig := loadUserConfig()
+	setupAppLogging(userConfig.LogEnabled)
+
+	// 释放嵌入的 cap.dex 到临时目录
+	extractCapDex()
+
+	// 创建应用 - 默认使用系统主题
+	a := app.New()
+	a.SetIcon(appIconResource)
+
+	// 检测系统当前主题并更新isDarkTheme变量
+	currentTheme := a.Settings().ThemeVariant()
+	themeModeValue := normalizeThemeMode(userConfig.ThemeMode)
+	customThemeSchemesValue := copyCustomThemeSchemes(userConfig.CustomThemeSchemes)
+	currentCustomThemeSchemes = copyCustomThemeSchemes(customThemeSchemesValue)
+	themeSchemeValue := normalizeThemeSchemeWithCustom(userConfig.ThemeScheme, customThemeSchemesValue)
+	isDarkTheme = themeModeIsDark(themeModeValue, currentTheme)
+	currentThemeSchemeID = themeSchemeValue
+
+	// 设置自定义主题
+	a.Settings().SetTheme(newMyTheme(themeSchemeValue, isDarkTheme))
+
+	// 创建设备选择下拉框
+	deviceSelect = widget.NewSelect([]string{deviceSelectPrompt}, func(value string) {
+		if value == deviceSelectPrompt {
+			if selectedDevice != "" {
+				deviceSelect.SetSelected(selectedDevice)
+			}
+			return
+		}
+		if value != "" {
+			selectedDevice = value
+			displayOptions := normalizeDisplayOptions(deviceDisplayOptions[value])
+			targetDisplay := selectedDisplayID
+			if !containsString(displayOptions, targetDisplay) {
+				targetDisplay = "0"
+			}
+			selectedDisplayID = targetDisplay
+			if displaySelect != nil {
+				displaySelect.Options = selectOptionsWithPrompt(displaySelectPrompt, displayOptions)
+				displaySelect.SetSelected(targetDisplay)
+				displaySelect.Refresh()
+			}
+		}
+	})
+	// 设置下拉框占位符
+	deviceSelect.PlaceHolder = deviceSelectPrompt
+	displaySelect = widget.NewSelect(selectOptionsWithPrompt(displaySelectPrompt, []string{"0"}), func(value string) {
+		if value == displaySelectPrompt {
+			displaySelect.SetSelected(selectedDisplayID)
+			return
+		}
+		if value == "" {
+			return
+		}
+		selectedDisplayID = value
+	})
+	displaySelect.SetSelected("0")
+	displaySelect.PlaceHolder = displaySelectPrompt
+
+	// 启动设备监控线程
+	go deviceMonitor()
+
+	// 延迟调用，先确保UI已经初始化完成
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		deviceRefreshChan <- true
+	}()
+
+	// 创建窗口
+	w := a.NewWindow("AutoGo图色助手")
+	remoteScreenshotServer := NewRemoteScreenshotServer()
+	remoteScreenshotPort := userConfig.RemoteScreenshotPort
+	autoSaveScreenshot := userConfig.AutoSaveScreenshot
+	screenshotSavePath := userConfig.ScreenshotSavePath
+	var remoteStatusLabel *widget.Label
+	var screenshotSourceSelect *widget.Select
+	var applyScreenshotSource func(string, bool)
+	var refreshRemoteStatus func()
+	remoteStatusStop := make(chan struct{})
+	mainWindowSize := initialWindowSize(0.70, 0.70)
+	apiFormatTemplates = copyAPIFormatTemplates(userConfig.FormatTemplates)
+	imageCodeTemplates = cloneImageCodeTemplates(userConfig.ImageCodeTemplates)
+	magnifierEnabled = userConfig.ShowMagnifier
+	autoCopyRangeEnabled = userConfig.AutoCopyRange
+	gridModeEnabled = userConfig.GridMode
+	gridColsValue = userConfig.GridCols
+	gridRowsValue = userConfig.GridRows
+	gridSpacingValue = userConfig.GridSpacing
+
+	// 创建标签页容器（使用修改后的DocTabs，无滚动条但支持关闭功能）
+	tabs := container.NewDocTabs()
+	tabs.SetTabLocation(container.TabLocationTop)
+	var updateRangeButton func()
+
+	// 设置标签页切换监听器
+	tabs.OnSelected = func(tab *container.TabItem) {
+		// 保存之前标签页的数据
+		saveCurrentTabData()
+
+		// 更新当前标签页
+		currentTab = tab
+
+		// 恢复新标签页的数据
+		restoreTabData(tab)
+		if updateRangeButton != nil {
+			updateRangeButton()
+		}
+	}
+
+	// 设置标签页关闭监听器
+	tabs.OnClosed = func(tab *container.TabItem) {
+		// 清理关闭标签页的数据
+		delete(tabDataMap, tab)
+
+		// 如果关闭的是当前标签页，清空当前引用
+		if currentTab == tab {
+			currentTab = nil
+			imageViewer = nil
+			colorPoints = make([]ColorPoint, 0)
+			if rectCoordEntry != nil {
+				rectCoordEntry.SetText(defaultRangeText)
+			}
+			if codeDisplayEntry != nil {
+				codeDisplayEntry.SetText("")
+			}
+			if refreshColorList != nil {
+				refreshColorList()
+			}
+			if updateRangeButton != nil {
+				updateRangeButton()
+			}
+		}
+	}
+
+	selectAdjacentTab := func(step int) {
+		count := len(tabs.Items)
+		if count < 2 {
+			return
+		}
+
+		index := tabs.SelectedIndex()
+		if index < 0 || index >= count {
+			tabs.SelectIndex(0)
+			return
+		}
+
+		nextIndex := index + step
+		if nextIndex < 0 || nextIndex >= count {
+			return
+		}
+		tabs.SelectIndex(nextIndex)
+	}
+
+	tabs.OnTabScrolled = func(_ *container.TabItem, event *fyne.ScrollEvent) {
+		if event == nil {
+			return
+		}
+
+		delta := event.Scrolled.DY
+		if delta == 0 {
+			delta = event.Scrolled.DX
+		}
+		switch {
+		case delta < 0:
+			selectAdjacentTab(1)
+		case delta > 0:
+			selectAdjacentTab(-1)
+		}
+	}
+
+	var tabContextMenu *widget.PopUpMenu
+	closeTabs := func(items []*container.TabItem) {
+		for _, tab := range append([]*container.TabItem(nil), items...) {
+			tabs.Close(tab)
+		}
+	}
+	tabs.OnTabSecondaryTapped = func(tab *container.TabItem, event *fyne.PointEvent) {
+		if tab == nil {
+			return
+		}
+
+		tabs.Select(tab)
+		if tabContextMenu != nil {
+			tabContextMenu.Hide()
+			tabContextMenu = nil
+		}
+
+		closeCurrentItem := fyne.NewMenuItem("关闭当前", func() {
+			tabs.Close(tab)
+		})
+		closeOtherItems := fyne.NewMenuItem("关闭其它标签页", func() {
+			items := make([]*container.TabItem, 0, len(tabs.Items))
+			for _, item := range tabs.Items {
+				if item != tab {
+					items = append(items, item)
+				}
+			}
+			closeTabs(items)
+		})
+		closeOtherItems.Disabled = len(tabs.Items) <= 1
+		closeAllItems := fyne.NewMenuItem("关闭所有标签页", func() {
+			closeTabs(tabs.Items)
+		})
+
+		menu := fyne.NewMenu("", closeCurrentItem, closeOtherItems, closeAllItems)
+		tabContextMenu = widget.NewPopUpMenu(menu, w.Canvas())
+		pos := fyne.NewPos(0, 0)
+		if event != nil {
+			pos = event.Position
+			if !event.AbsolutePosition.IsZero() {
+				pos = event.AbsolutePosition
+			}
+		}
+		tabContextMenu.ShowAtPosition(pos)
+	}
+
+	// 标签页计数器
+	tabCounter := 0
+
+	// 创建第一个标签页（欢迎页）- 添加详细的使用说明
+	welcomeTitle := widget.NewLabelWithStyle("欢迎使用 AutoGo 图色助手", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+
+	instructionsText := `
+📱 开始使用
+  • 点击「截图」按钮从设备截取屏幕
+  • 点击「载入」按钮导入本地图片
+  • 每次截图/载入会在新标签页打开
+
+⌨️ 快捷键
+  • 左键点击/拖动：拖动图像
+  • Ctrl + 左键点击：在图像上标记取色点
+  • 范围按钮 / Ctrl+R：进入一次范围框选
+  • Ctrl + 滚轮：缩放图像
+  • 右键点击：打开坐标/颜色/点位菜单
+  • ↑ ↓ ← →  移动鼠标（1像素）
+  • Space     标记当前位置
+  • Enter     生成代码
+
+🎨 功能说明
+  • 找色模式：多点找色（颜色匹配）
+  • 比色模式：多点比色（精确比对）
+  • 点阵模式：快速生成网格取色点
+  • 偏色设置：容差值（如：101010）
+  • 裁剪功能：框选后点击「裁剪」
+
+💡 提示
+  • 生成代码弹窗可选择输出格式、调整模板并复制
+  • 没有主动框选区域的时候会根据标记点自动生成区域
+  • 放大镜会实时显示鼠标位置的像素放大图
+  • 右侧表格显示所有取色点信息
+  • 点击「生成代码」按钮获取代码
+  • 标签页右侧有关闭按钮（❌）
+`
+
+	instructionsLabel := widget.NewLabel(instructionsText)
+	instructionsLabel.Wrapping = fyne.TextWrapWord
+
+	welcomeContent := container.NewVBox(
+		layout.NewSpacer(),
+		welcomeTitle,
+		widget.NewSeparator(),
+		instructionsLabel,
+		layout.NewSpacer(),
+	)
+
+	welcomeScroll := container.NewScroll(welcomeContent)
+	firstTab := container.NewTabItem("🏠", welcomeScroll)
+	tabs.Append(firstTab)
+
+	// 初始化当前标签页为欢迎页
+	currentTab = firstTab
+
+	// 初始化 imageViewer 为 nil，将在第一次截图或载入时创建
+	imageViewer = nil
+
+	// 初始化空的颜色点列表，不再使用generateSampleData
+	colorPoints = make([]ColorPoint, 0)
+	var saveCurrentConfig func()
+
+	// 设置刷新表格的函数
+	refreshColorList = func() {
+		// 使用fyne.Do确保在主线程中执行UI更新
+		fyne.Do(func() {
+			if tableContent != nil {
+				tableContent.Refresh()
+			}
+			refreshImagesAPIFields()
+		})
+	}
+
+	// 主题切换功能
+	toggleTheme := func() {
+		themeSchemeValue = nextThemeSchemeWithCustom(themeSchemeValue, customThemeSchemesValue)
+		currentThemeSchemeID = themeSchemeValue
+		a.Settings().SetTheme(newMyTheme(themeSchemeValue, isDarkTheme))
+
+		// 切换配色方案后更新表头和列表
+		updateTableHeader()
+		updateTableSelection()
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+
+	// 创建区域坐标显示控件
+	rectCoordEntry = widget.NewEntry()
+	rectCoordEntry.OnChanged = func(string) {
+		refreshImagesAPIFields()
+	}
+
+	// 创建偏色值输入控件
+	colorOffsetEntry = widget.NewEntry()
+	colorOffsetEntry.SetPlaceHolder("偏色:101010") // 默认占位符为101010（十六进制格式）
+	colorOffsetEntry.MultiLine = false           // 单行显示
+	colorOffsetEntry.Wrapping = fyne.TextTruncate
+
+	// 创建找色模式选择
+	colorModeRadio = widget.NewRadioGroup([]string{"找色", "比色"}, nil)
+	colorModeRadio.SetSelected("找色") // 默认选择多点找色
+	colorModeRadio.Horizontal = true // 水平排列
+
+	// 点阵参数获取回调函数（每次创建新的imageViewer时都需要设置）
+	getGridParamsFunc := func() (cols, rows, spacing int, hasParams bool) {
+		if gridModeEnabled {
+			return gridColsValue, gridRowsValue, gridSpacingValue, true
+		}
+		return 0, 0, 0, false
+	}
+	configureImageViewer := func(v *ImageViewer) {
+		v.window = w
+		v.getGridParams = getGridParamsFunc
+		v.onRangeModeChanged = func(bool) {
+			if updateRangeButton != nil {
+				updateRangeButton()
+			}
+		}
+	}
+	fitImageToView := func(v *ImageViewer) {
+		v.FitToView()
+		fyne.Do(func() {
+			v.FitToView()
+		})
+	}
+	openNodeImageTab := func(img image.Image, onNodeClick func(x, y int)) *ImageViewer {
+		if img == nil {
+			return nil
+		}
+
+		// 保存当前标签页的数据
+		saveCurrentTabData()
+
+		newImageViewer := NewImageViewer()
+		newImageViewer.nodeToolOnly = true
+		newMagnifier := NewMagnifierWidget()
+		newImgContainer := container.New(&topLeftLayout{}, newImageViewer)
+		newScrollContainer := newImageScrollContainer(newImgContainer, newImageViewer)
+
+		newImageViewer.scrollContainer = newScrollContainer
+		newImageViewer.magnifier = newMagnifier
+		configureImageViewer(newImageViewer)
+		newImageViewer.onMouseUp = func(x, y int) {
+			if onNodeClick == nil {
+				return
+			}
+			if distance(newImageViewer.mouseDownX, newImageViewer.mouseDownY, x, y) > 4 {
+				return
+			}
+			onNodeClick(x, y)
+		}
+		newImageViewer.SetImage(img)
+
+		newScrollWithMagnifier := container.NewStack(newScrollContainer, newMagnifier)
+		tabCounter++
+		tabName := "节点 " + time.Now().Format("15:04:05")
+		newTab := container.NewTabItem(tabName, newScrollWithMagnifier)
+
+		tabDataMap[newTab] = &TabData{
+			colorPoints:        make([]ColorPoint, 0),
+			markRects:          make([]MarkRect, 0),
+			manualRectSelected: false,
+			imageViewer:        newImageViewer,
+			generatedCode:      "",
+			nodeToolOnly:       true,
+		}
+
+		tabs.Append(newTab)
+		tabs.Select(newTab)
+		currentTab = newTab
+		imageViewer = nil
+		fitImageToView(newImageViewer)
+
+		colorPoints = make([]ColorPoint, 0)
+		if rectCoordEntry != nil {
+			rectCoordEntry.SetText(defaultRangeText)
+		}
+		if codeDisplayEntry != nil {
+			codeDisplayEntry.SetText("")
+		}
+		if refreshColorList != nil {
+			refreshColorList()
+		}
+		return newImageViewer
+	}
+
+	// 创建左侧工具栏按钮 - 使用带动画的截图按钮
+	var screenshotBtn *AnimatedScreenshotButton
+	captureScreenshot := func() {
+		if screenshotBtn == nil || screenshotBtn.IsLoading() {
+			return
+		}
+
+		// 启动加载动画
+		screenshotBtn.StartLoading()
+		shouldAutoSave := autoSaveScreenshot
+		autoSavePath := screenshotSavePath
+
+		// 异步执行截图操作
+		go func() {
+			var capturedImg image.Image
+			var err error
+			if screenshotSourceIsRemote() {
+				capturedImg, err = remoteScreenshotServer.RequestScreenshot()
+			} else {
+				deviceID := selectedAndroidDeviceID()
+				if deviceID == "" {
+					err = fmt.Errorf("请先选择本地 ADB 设备")
+				} else {
+					capturedImg, err = captureScreenWithADB(deviceID)
+				}
+			}
+			if err == nil && shouldAutoSave {
+				if savedPath, saveErr := saveScreenshotToDirectory(capturedImg, autoSavePath); saveErr != nil {
+					log.Printf("截图自动保存失败: %v", saveErr)
+				} else {
+					log.Printf("截图已自动保存: %s", savedPath)
+				}
+			}
+
+			// 使用 fyne.Do 确保在主线程中更新UI
+			fyne.Do(func() {
+				// 停止动画
+				screenshotBtn.StopLoading()
+
+				if err != nil {
+					log.Printf("截图失败: %v", err)
+					dialog.ShowError(fmt.Errorf("截图失败: %v", err), w)
+					return
+				}
+
+				// 转换为NRGBA格式
+				capturedImg = convertToNRGBA(capturedImg)
+
+				// 保存当前标签页的数据
+				saveCurrentTabData()
+
+				// 创建新的图像查看器
+				newImageViewer := NewImageViewer()
+
+				// 创建新的放大镜
+				newMagnifier := NewMagnifierWidget()
+
+				// 创建图像容器
+				newImgContainer := container.New(&topLeftLayout{}, newImageViewer)
+				newScrollContainer := newImageScrollContainer(newImgContainer, newImageViewer)
+
+				// 设置引用
+				newImageViewer.scrollContainer = newScrollContainer
+				newImageViewer.magnifier = newMagnifier
+				configureImageViewer(newImageViewer)
+
+				// 设置图像
+				newImageViewer.SetImage(capturedImg)
+
+				// 创建新标签页
+				newScrollWithMagnifier := container.NewStack(newScrollContainer, newMagnifier)
+				tabCounter++
+				// 使用时间作为标签名称
+				tabName := time.Now().Format("15:04:05")
+				newTab := container.NewTabItem(tabName, newScrollWithMagnifier)
+
+				// 初始化新标签页的数据
+				tabDataMap[newTab] = &TabData{
+					colorPoints:        make([]ColorPoint, 0),
+					markRects:          make([]MarkRect, 0),
+					manualRectSelected: false,
+					imageViewer:        newImageViewer,
+					generatedCode:      "",
+				}
+
+				tabs.Append(newTab)
+
+				// 切换到新标签页
+				tabs.Select(newTab)
+
+				// 更新当前标签页引用
+				currentTab = newTab
+
+				// 更新当前的imageViewer引用为新标签页的viewer
+				imageViewer = newImageViewer
+				fitImageToView(newImageViewer)
+				w.Canvas().Focus(newImageViewer)
+
+				// 清空颜色点列表和矩形区域
+				colorPoints = make([]ColorPoint, 0)
+				if rectCoordEntry != nil {
+					rectCoordEntry.SetText(defaultRangeText)
+				}
+				if codeDisplayEntry != nil {
+					codeDisplayEntry.SetText("")
+				}
+
+				// 刷新表格
+				if refreshColorList != nil {
+					refreshColorList()
+				}
+			})
+		}()
+	}
+	screenshotBtn = NewAnimatedScreenshotButton("截图", theme.ContentCopyIcon(), captureScreenshot)
+
+	importImage := func() {
+		// 使用系统原生文件打开对话框
+		go func() {
+			filePaths, err := openImageFiles()
+			if err != nil {
+				if errors.Is(err, nativedialog.ErrCancelled) {
+					return
+				}
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("选择文件失败: %v", err), w)
+				})
+				return
+			}
+			if len(filePaths) == 0 {
+				return
+			}
+
+			type importedImage struct {
+				filePath string
+				img      image.Image
+			}
+
+			importedImages := make([]importedImage, 0, len(filePaths))
+			failed := make([]string, 0)
+
+			for _, filePath := range filePaths {
+				// 读取文件内容
+				data, err := ioutil.ReadFile(filePath)
+				if err != nil {
+					failed = append(failed, fmt.Sprintf("%s: 读取文件失败: %v", filePath, err))
+					continue
+				}
+
+				// 根据文件扩展名解码图像
+				var img image.Image
+				ext := strings.ToLower(filepath.Ext(filePath))
+
+				switch ext {
+				case ".png":
+					img, err = png.Decode(bytes.NewReader(data))
+				case ".jpg", ".jpeg":
+					img, err = jpeg.Decode(bytes.NewReader(data))
+				case ".bmp":
+					img, err = bmp.Decode(bytes.NewReader(data))
+				default:
+					// 尝试自动检测格式
+					img, _, err = image.Decode(bytes.NewReader(data))
+				}
+
+				if err != nil {
+					failed = append(failed, fmt.Sprintf("%s: 解码图像失败: %v", filePath, err))
+					continue
+				}
+
+				// 转换为NRGBA格式
+				importedImages = append(importedImages, importedImage{
+					filePath: filePath,
+					img:      convertToNRGBA(img),
+				})
+			}
+
+			if len(importedImages) == 0 {
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("图片加载失败:\n%s", strings.Join(failed, "\n")), w)
+				})
+				return
+			}
+
+			// 在主线程中更新UI
+			fyne.Do(func() {
+				// 保存当前标签页的数据
+				saveCurrentTabData()
+
+				for _, imported := range importedImages {
+					// 创建新的图像查看器和标签页
+					newImageViewer := NewImageViewer()
+					newMagnifier := NewMagnifierWidget()
+
+					newImgContainer := container.New(&topLeftLayout{}, newImageViewer)
+					newScrollContainer := newImageScrollContainer(newImgContainer, newImageViewer)
+
+					newImageViewer.scrollContainer = newScrollContainer
+					newImageViewer.magnifier = newMagnifier
+					configureImageViewer(newImageViewer)
+					newImageViewer.SetImage(imported.img)
+
+					// 创建新标签页
+					newScrollWithMagnifier := container.NewStack(newScrollContainer, newMagnifier)
+					tabCounter++
+
+					// 使用文件名作为标签名称
+					tabName := filepath.Base(imported.filePath)
+					newTab := container.NewTabItem(tabName, newScrollWithMagnifier)
+
+					// 初始化新标签页的数据
+					tabDataMap[newTab] = &TabData{
+						colorPoints:        make([]ColorPoint, 0),
+						markRects:          make([]MarkRect, 0),
+						manualRectSelected: false,
+						imageViewer:        newImageViewer,
+						generatedCode:      "",
+					}
+
+					tabs.Append(newTab)
+					tabs.Select(newTab)
+
+					// 更新当前标签页引用
+					currentTab = newTab
+
+					// 更新当前imageViewer引用
+					imageViewer = newImageViewer
+					fitImageToView(newImageViewer)
+					w.Canvas().Focus(newImageViewer)
+				}
+
+				// 清空颜色点列表和矩形区域
+				colorPoints = make([]ColorPoint, 0)
+				if rectCoordEntry != nil {
+					rectCoordEntry.SetText(defaultRangeText)
+				}
+				if codeDisplayEntry != nil {
+					codeDisplayEntry.SetText("")
+				}
+
+				// 刷新表格
+				if refreshColorList != nil {
+					refreshColorList()
+				}
+
+				if len(failed) > 0 {
+					dialog.ShowError(fmt.Errorf("部分图片加载失败:\n%s", strings.Join(failed, "\n")), w)
+				}
+			})
+		}()
+	}
+	importBtn := widget.NewButtonWithIcon("载入", theme.FolderOpenIcon(), importImage)
+	importBtn.Importance = widget.MediumImportance
+
+	saveBtn := widget.NewButtonWithIcon("保存", theme.DocumentSaveIcon(), func() {
+		if imageViewer == nil || imageViewer.image == nil {
+			// 没有图像可保存
+			dialog.ShowInformation("提示", "当前没有可保存的图像", w)
+			return
+		}
+
+		// 保存当前图像的引用，避免在 goroutine 中被修改
+		imgToSave := imageViewer.image
+
+		// 使用系统原生文件保存对话框
+		go func() {
+			filePath, err := nativedialog.File().
+				Filter("PNG 图片", "png").
+				Filter("JPEG 图片", "jpg", "jpeg").
+				Title("保存图片").
+				SetStartFile("screenshot.png").
+				Save()
+
+			if err != nil {
+				// 用户取消或发生错误
+				return
+			}
+
+			// 获取文件扩展名
+			ext := strings.ToLower(filepath.Ext(filePath))
+
+			// 如果没有扩展名，默认添加.png
+			if ext == "" {
+				filePath = filePath + ".png"
+				ext = ".png"
+			}
+
+			// 创建文件
+			file, err := os.Create(filePath)
+			if err != nil {
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("创建文件失败: %v", err), w)
+				})
+				return
+			}
+			defer file.Close()
+
+			// 根据扩展名编码图像
+			if ext == ".jpg" || ext == ".jpeg" {
+				err = jpeg.Encode(file, imgToSave, &jpeg.Options{Quality: 100})
+			} else {
+				err = png.Encode(file, imgToSave)
+			}
+
+			if err != nil {
+				fyne.Do(func() {
+					dialog.ShowError(fmt.Errorf("保存图像失败: %v", err), w)
+				})
+				return
+			}
+		}()
+	})
+	saveBtn.Importance = widget.MediumImportance
+
+	rotateBtn := widget.NewButtonWithIcon("旋转", theme.MediaReplayIcon(), func() {
+		if imageViewer == nil || imageViewer.originalImage == nil {
+			return // 如果没有图像，不执行任何操作
+		}
+
+		// 计算新的旋转角度 (每次点击增加90度)
+		newDegrees := (imageViewer.rotationDegrees + 90) % 360
+
+		// 执行旋转
+		imageViewer.RotateImage(newDegrees)
+	})
+	rotateBtn.Importance = widget.MediumImportance
+
+	// 底部额外按钮
+	cutBtn := widget.NewButtonWithIcon("裁剪", theme.ContentCutIcon(), func() {
+		// 检查是否有图像
+		if imageViewer == nil || imageViewer.image == nil {
+			dialog.ShowInformation("提示", "当前没有可裁剪的图像", w)
+			return
+		}
+
+		// 检查是否有选择矩形区域
+		if len(imageViewer.markRects) == 0 {
+			dialog.ShowInformation("提示", "请先使用鼠标在图像上拖动选择要裁剪的区域", w)
+			return
+		}
+
+		// 获取选择区域的坐标
+		rect := imageViewer.markRects[0]
+
+		// 确保坐标是左上角到右下角的顺序
+		minX := min(rect.X1, rect.X2)
+		minY := min(rect.Y1, rect.Y2)
+		maxX := max(rect.X1, rect.X2)
+		maxY := max(rect.Y1, rect.Y2)
+
+		// 确保裁剪区域在图像范围内
+		bounds := imageViewer.image.Bounds()
+		if minX < bounds.Min.X {
+			minX = bounds.Min.X
+		}
+		if minY < bounds.Min.Y {
+			minY = bounds.Min.Y
+		}
+		if maxX > bounds.Max.X {
+			maxX = bounds.Max.X
+		}
+		if maxY > bounds.Max.Y {
+			maxY = bounds.Max.Y
+		}
+
+		// 检查裁剪区域是否有效
+		if minX >= maxX || minY >= maxY {
+			dialog.ShowInformation("提示", "选择的裁剪区域无效", w)
+			return
+		}
+
+		// 创建裁剪区域
+		cropRect := image.Rect(minX, minY, maxX, maxY)
+
+		// 裁剪图像
+		croppedImg := cropImage(imageViewer.image, cropRect)
+
+		// 保存当前标签页的数据
+		saveCurrentTabData()
+
+		// 创建新的图像查看器和标签页来展示裁剪后的图片
+		newImageViewer := NewImageViewer()
+		newMagnifier := NewMagnifierWidget()
+
+		// 创建图像容器
+		newImgContainer := container.New(&topLeftLayout{}, newImageViewer)
+		newScrollContainer := newImageScrollContainer(newImgContainer, newImageViewer)
+
+		// 设置引用
+		newImageViewer.scrollContainer = newScrollContainer
+		newImageViewer.magnifier = newMagnifier
+		configureImageViewer(newImageViewer)
+
+		// 设置裁剪后的图像
+		newImageViewer.SetImage(croppedImg)
+
+		// 创建新标签页
+		newScrollWithMagnifier := container.NewStack(newScrollContainer, newMagnifier)
+		tabCounter++
+		// 使用"裁剪_时间"作为标签名称
+		tabName := "裁剪_" + time.Now().Format("15:04:05")
+		newTab := container.NewTabItem(tabName, newScrollWithMagnifier)
+
+		// 初始化新标签页的数据
+		tabDataMap[newTab] = &TabData{
+			colorPoints:        make([]ColorPoint, 0),
+			markRects:          make([]MarkRect, 0),
+			manualRectSelected: false,
+			imageViewer:        newImageViewer,
+			generatedCode:      "",
+		}
+
+		tabs.Append(newTab)
+
+		// 切换到新标签页
+		tabs.Select(newTab)
+
+		// 更新当前标签页引用
+		currentTab = newTab
+
+		// 更新当前的imageViewer引用为新标签页的viewer
+		imageViewer = newImageViewer
+		fitImageToView(newImageViewer)
+		w.Canvas().Focus(newImageViewer)
+
+		// 清空颜色点列表和矩形区域
+		colorPoints = make([]ColorPoint, 0)
+		if rectCoordEntry != nil {
+			rectCoordEntry.SetText(defaultRangeText)
+		}
+		if codeDisplayEntry != nil {
+			codeDisplayEntry.SetText("")
+		}
+
+		// 刷新表格
+		if refreshColorList != nil {
+			refreshColorList()
+		}
+	})
+	cutBtn.Importance = widget.MediumImportance
+
+	// 字库制作按钮
+	ocrSelectedFontPath := ""
+	var syncOCRFont func(string, []FontChar)
+	openFontLibrary := func() {
+		path := ocrSelectedFontPath
+		if path == "" {
+			dialog.ShowInformation("提示", "请先选择字库 TXT 文件，空文件也可以用于制作字库", w)
+			return
+		}
+		openFontLibWindow(w, path, func(chars []FontChar) {
+			if syncOCRFont != nil {
+				syncOCRFont(path, chars)
+			}
+		})
+	}
+	fontLibBtn := widget.NewButtonWithIcon("字库制作", theme.GridIcon(), openFontLibrary)
+	fontLibBtn.Importance = widget.MediumImportance
+
+	// 主题切换按钮使用高重要性，使其更加突出
+	themeBtn := widget.NewButtonWithIcon("配色", theme.ColorPaletteIcon(), toggleTheme)
+	themeBtn.Importance = widget.MediumImportance
+
+	// 创建代码显示框（多行只读文本框）
+	codeDisplayEntry = widget.NewMultiLineEntry()
+	codeDisplayEntry.SetPlaceHolder("生成的代码将显示在这里...")
+	codeDisplayEntry.Wrapping = fyne.TextWrapWord
+	codeDisplayEntry.TextStyle = fyne.TextStyle{Monospace: true}
+
+	// 控件初始化完成后绑定生成弹窗，按钮和快捷键共用入口。
+	var openGenerateCode func()
+	generateCodeFunc := func() {
+		if openGenerateCode != nil {
+			openGenerateCode()
+		}
+	}
+	generateCodeBtn := widget.NewButtonWithIcon("生成代码", theme.DocumentCreateIcon(), generateCodeFunc)
+	generateCodeBtn.Importance = widget.HighImportance
+	triggerGenerateCode = generateCodeFunc
+
+	shortcutConfig := normalizeShortcutConfig(userConfig.Shortcuts)
+	toolButtonConfig := normalizeToolButtonConfigs(userConfig.ToolButtons)
+	shortcutTextFor := func(id string) string {
+		return shortcutText(shortcutConfig, id)
+	}
+	buttonTextWithShortcut := func(label, id string) string {
+		shortcut := shortcutTextFor(id)
+		if shortcut == "" {
+			return label
+		}
+		return fmt.Sprintf("%s (%s)", label, shortcut)
+	}
+	type appCommand struct {
+		id       string
+		label    string
+		category string
+		action   func()
+	}
+	commandByID := make(map[string]appCommand)
+	registerCommand := func(id string, action func()) {
+		def, ok := commandDefinitionByID(id)
+		if !ok {
+			log.Printf("跳过未知命令注册: id=%s", id)
+			return
+		}
+		commandByID[id] = appCommand{
+			id:       id,
+			label:    def.Label,
+			category: def.Category,
+			action:   action,
+		}
+	}
+	shortcutSettingsGroup := func(command appCommand) string {
+		switch command.category {
+		case "节点", "节点工具":
+			return "节点工具"
+		case "App信息":
+			return "App信息"
+		default:
+			return "图色工具"
+		}
+	}
+	shortcutSettingsGroupOrder := func(group string) int {
+		switch group {
+		case "图色工具":
+			return 0
+		case "节点工具":
+			return 1
+		case "App信息":
+			return 2
+		default:
+			return 3
+		}
+	}
+	commandsForSettings := func() []appCommand {
+		commands := make([]appCommand, 0, len(commandByID))
+		for _, command := range commandByID {
+			commands = append(commands, command)
+		}
+		sort.SliceStable(commands, func(i, j int) bool {
+			leftGroup := shortcutSettingsGroup(commands[i])
+			rightGroup := shortcutSettingsGroup(commands[j])
+			if leftGroup != rightGroup {
+				return shortcutSettingsGroupOrder(leftGroup) < shortcutSettingsGroupOrder(rightGroup)
+			}
+			return commandDefinitionOrder(commands[i].id) < commandDefinitionOrder(commands[j].id)
+		})
+		return commands
+	}
+	var registeredShortcuts []fyne.Shortcut
+	var refreshShortcutButtonTexts func()
+	unregisterConfiguredShortcuts := func() {
+		for _, shortcut := range registeredShortcuts {
+			w.Canvas().RemoveShortcut(shortcut)
+		}
+		registeredShortcuts = registeredShortcuts[:0]
+	}
+	registerConfiguredShortcuts := func() {
+		unregisterConfiguredShortcuts()
+
+		for _, command := range commandsForSettings() {
+			shortcut, _, err := parseShortcutText(shortcutTextFor(command.id))
+			if err != nil {
+				log.Printf("跳过无效快捷键配置: command=%s shortcut=%q err=%v", command.id, shortcutTextFor(command.id), err)
+				continue
+			}
+			if shortcut == nil || command.action == nil {
+				continue
+			}
+			action := command.action
+			w.Canvas().AddShortcut(shortcut, func(fyne.Shortcut) {
+				action()
+			})
+			registeredShortcuts = append(registeredShortcuts, shortcut)
+		}
+	}
+	registerCommand(commandToggleTheme, toggleTheme)
+	registerCommand(commandFontLibrary, openFontLibrary)
+	registerCommand(shortcutActionScreenshot, captureScreenshot)
+	registerCommand(shortcutActionImport, importImage)
+	registerCommand(commandCopyCode, generateCodeFunc)
+	applyThemeSettings := func(mode, scheme string, customSchemes []CustomThemeSchemeConfig) {
+		themeModeValue = normalizeThemeMode(mode)
+		customThemeSchemesValue = normalizeCustomThemeSchemes(customSchemes)
+		currentCustomThemeSchemes = copyCustomThemeSchemes(customThemeSchemesValue)
+		themeSchemeValue = normalizeThemeSchemeWithCustom(scheme, customThemeSchemesValue)
+		currentThemeSchemeID = themeSchemeValue
+		isDarkTheme = themeModeIsDark(themeModeValue, a.Settings().ThemeVariant())
+		a.Settings().SetTheme(newMyTheme(themeSchemeValue, isDarkTheme))
+		updateTableHeader()
+		updateTableSelection()
+	}
+
+	// 点阵模式主按钮
+	var gridModeBtn *widget.Button
+	var centerRightSplit *container.Split
+	updateGridBtn := func() {
+		if gridModeEnabled {
+			gridModeBtn.SetText("● 点阵模式")
+			gridModeBtn.Importance = widget.HighImportance
+		} else {
+			gridModeBtn.SetText("○ 点阵模式")
+			gridModeBtn.Importance = widget.MediumImportance
+		}
+		gridModeBtn.Refresh()
+	}
+
+	toggleGridMode := func() {
+		gridModeEnabled = !gridModeEnabled
+		updateGridBtn()
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+	gridModeBtn = widget.NewButton("○ 点阵模式", toggleGridMode)
+	registerCommand(commandToggleGrid, toggleGridMode)
+	updateGridBtn() // 初始化按钮状态
+
+	openSystemConfigDialog := func() {
+		shortcutsRestored := false
+		unregisterConfiguredShortcuts()
+		restoreDialogShortcuts := func() {
+			if shortcutsRestored {
+				return
+			}
+			shortcutsRestored = true
+			registerConfiguredShortcuts()
+		}
+
+		logEnabledCheck := widget.NewCheck("开启日志文件", nil)
+		logEnabledCheck.SetChecked(appLoggingEnabled)
+		logPathText := "日志关闭时仅输出到控制台。"
+		if appLogPath != "" {
+			logPathText = "日志文件：" + appLogPath
+		}
+		logPathLabel := widget.NewLabel(logPathText)
+		logPathLabel.Wrapping = fyne.TextWrapWord
+		remotePortEntry := widget.NewEntry()
+		remotePortEntry.SetText(strconv.Itoa(remoteScreenshotPort))
+		remotePortEntry.SetPlaceHolder("6600")
+		autoSaveScreenshotCheck := widget.NewCheck("截图后自动保存", nil)
+		autoSaveScreenshotCheck.SetChecked(autoSaveScreenshot)
+		screenshotSavePathEntry := widget.NewEntry()
+		screenshotSavePathEntry.SetText(screenshotSavePath)
+		screenshotSavePathEntry.SetPlaceHolder(defaultScreenshotSavePath)
+		autoSaveScreenshotCheck.OnChanged = func(checked bool) {
+			if checked {
+				screenshotSavePathEntry.Enable()
+			} else {
+				screenshotSavePathEntry.Disable()
+			}
+		}
+		if !autoSaveScreenshot {
+			screenshotSavePathEntry.Disable()
+		}
+		autoSaveScreenshotPanel := container.NewVBox(
+			widget.NewLabelWithStyle("截图自动保存", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			autoSaveScreenshotCheck,
+			container.NewBorder(nil, nil, widget.NewLabel("保存目录"), nil, screenshotSavePathEntry),
+			widget.NewLabel("ADB 和远程 HTTP 截图都会保存为 PNG 文件。目录不存在时会自动创建。"),
+		)
+		remoteScreenshotPanel := container.NewVBox(
+			widget.NewLabelWithStyle("远程截图服务", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewLabel("截图来源选择“远程 HTTP”时，助手只提供截图接口，不会启动本地 ADB 截图。"),
+			container.NewBorder(nil, nil, widget.NewLabel("监听端口"), nil, remotePortEntry),
+			widget.NewLabel("移动端连接地址使用本机内网穿透后的地址；端口修改后保存即可生效。"),
+		)
+		themeModeSelect := widget.NewSelect(appThemeModeOptions, nil)
+		themeModeSelect.SetSelected(themeModeDisplay(themeModeValue))
+		customSchemesDraft := copyCustomThemeSchemes(customThemeSchemesValue)
+		selectedThemeSchemeID := normalizeThemeSchemeWithCustom(themeSchemeValue, customSchemesDraft)
+		themeSchemeSelect := widget.NewSelect(themeSchemeDisplayOptionsFor(customSchemesDraft), nil)
+		themeSchemeSelect.SetSelected(themeSchemeDisplayFor(selectedThemeSchemeID, customSchemesDraft))
+		themePreviewRow := container.NewHBox()
+		customSchemeSelect := widget.NewSelect(nil, nil)
+		customNameEntry := widget.NewEntry()
+		customNameEntry.SetPlaceHolder("如: 我的配色")
+		customPrimaryEntry := widget.NewEntry()
+		customPrimaryEntry.SetPlaceHolder("#1D4ED8")
+		customBackgroundEntry := widget.NewEntry()
+		customBackgroundEntry.SetPlaceHolder("#F1F5F9")
+		customButtonEntry := widget.NewEntry()
+		customButtonEntry.SetPlaceHolder("#E2E8F0")
+		customHeaderEntry := widget.NewEntry()
+		customHeaderEntry.SetPlaceHolder("#D7E2F2")
+		var selectedCustomThemeID string
+		var updateCustomBtn *widget.Button
+		var deleteCustomBtn *widget.Button
+		customEditorUpdating := false
+		var refreshThemePreview func()
+
+		newThemeSwatch := func(label string, c color.Color) fyne.CanvasObject {
+			swatch := canvas.NewRectangle(c)
+			swatch.SetMinSize(fyne.NewSize(34, 18))
+			swatch.StrokeColor = color.NRGBA{0, 0, 0, 70}
+			swatch.StrokeWidth = 1
+			return container.NewHBox(swatch, widget.NewLabel(label))
+		}
+		findCustomSchemeIndex := func(id string) int {
+			for i, scheme := range customSchemesDraft {
+				if scheme.ID == id {
+					return i
+				}
+			}
+			return -1
+		}
+		customSchemeOptions := func() []string {
+			options := make([]string, 0, len(customSchemesDraft))
+			for i, scheme := range customSchemesDraft {
+				name := strings.TrimSpace(scheme.Name)
+				if name == "" {
+					name = fmt.Sprintf("未命名%d", i+1)
+				}
+				options = append(options, customThemeSchemeDisplayName(name))
+			}
+			return options
+		}
+		customSchemeIDFromDisplay := func(display string) string {
+			for i, scheme := range customSchemesDraft {
+				name := strings.TrimSpace(scheme.Name)
+				if name == "" {
+					name = fmt.Sprintf("未命名%d", i+1)
+				}
+				if display == customThemeSchemeDisplayName(name) {
+					return scheme.ID
+				}
+			}
+			return ""
+		}
+		refreshThemePreview = func() {
+			mode := themeModeFromDisplay(themeModeSelect.Selected)
+			palette := themePaletteForWithCustom(selectedThemeSchemeID, themeModeIsDark(mode, a.Settings().ThemeVariant()), customSchemesDraft)
+			themePreviewRow.Objects = []fyne.CanvasObject{
+				newThemeSwatch("主色", palette.Primary),
+				newThemeSwatch("背景", palette.Background),
+				newThemeSwatch("按钮", palette.Button),
+				newThemeSwatch("表头", palette.HeaderBackground),
+			}
+			themePreviewRow.Refresh()
+		}
+		refreshThemeSchemeSelect := func() {
+			selectedThemeSchemeID = normalizeThemeSchemeWithCustom(selectedThemeSchemeID, customSchemesDraft)
+			themeSchemeSelect.SetOptions(themeSchemeDisplayOptionsFor(customSchemesDraft))
+			themeSchemeSelect.SetSelected(themeSchemeDisplayFor(selectedThemeSchemeID, customSchemesDraft))
+			refreshThemePreview()
+		}
+		refreshCustomSchemeSelect := func() {
+			customSchemeSelect.SetOptions(customSchemeOptions())
+			if selectedCustomThemeID != "" {
+				idx := findCustomSchemeIndex(selectedCustomThemeID)
+				if idx >= 0 {
+					name := strings.TrimSpace(customSchemesDraft[idx].Name)
+					if name == "" {
+						name = fmt.Sprintf("未命名%d", idx+1)
+					}
+					customSchemeSelect.SetSelected(customThemeSchemeDisplayName(name))
+				}
+			}
+		}
+		setCustomEditorEnabled := func(enabled bool) {
+			for _, entry := range []*widget.Entry{customNameEntry, customPrimaryEntry, customBackgroundEntry, customButtonEntry, customHeaderEntry} {
+				if enabled {
+					entry.Enable()
+				} else {
+					entry.Disable()
+				}
+			}
+			if updateCustomBtn != nil {
+				if enabled {
+					updateCustomBtn.Enable()
+				} else {
+					updateCustomBtn.Disable()
+				}
+			}
+			if deleteCustomBtn != nil {
+				if enabled {
+					deleteCustomBtn.Enable()
+				} else {
+					deleteCustomBtn.Disable()
+				}
+			}
+		}
+		loadCustomEditor := func(id string) {
+			customEditorUpdating = true
+			defer func() { customEditorUpdating = false }()
+			selectedCustomThemeID = id
+			idx := findCustomSchemeIndex(id)
+			if idx < 0 {
+				customNameEntry.SetText("")
+				customPrimaryEntry.SetText("")
+				customBackgroundEntry.SetText("")
+				customButtonEntry.SetText("")
+				customHeaderEntry.SetText("")
+				setCustomEditorEnabled(false)
+				return
+			}
+			scheme := customSchemesDraft[idx]
+			setCustomEditorEnabled(true)
+			customNameEntry.SetText(scheme.Name)
+			customPrimaryEntry.SetText(scheme.Primary)
+			customBackgroundEntry.SetText(scheme.Background)
+			customButtonEntry.SetText(scheme.Button)
+			customHeaderEntry.SetText(scheme.HeaderBackground)
+		}
+		updateCustomDraftFromFields := func() {
+			if customEditorUpdating || selectedCustomThemeID == "" {
+				return
+			}
+			idx := findCustomSchemeIndex(selectedCustomThemeID)
+			if idx < 0 {
+				return
+			}
+			customSchemesDraft[idx].Name = customNameEntry.Text
+			customSchemesDraft[idx].Primary = customPrimaryEntry.Text
+			customSchemesDraft[idx].Background = customBackgroundEntry.Text
+			customSchemesDraft[idx].Button = customButtonEntry.Text
+			customSchemesDraft[idx].HeaderBackground = customHeaderEntry.Text
+		}
+		for _, entry := range []*widget.Entry{customNameEntry, customPrimaryEntry, customBackgroundEntry, customButtonEntry, customHeaderEntry} {
+			entry.OnChanged = func(string) {
+				updateCustomDraftFromFields()
+			}
+		}
+		applyCustomEditor := func() bool {
+			updateCustomDraftFromFields()
+			idx := findCustomSchemeIndex(selectedCustomThemeID)
+			if idx < 0 {
+				dialog.ShowInformation("提示", "请先新增或选择一个自定义配色方案", w)
+				return false
+			}
+			if err := validateCustomThemeSchemes([]CustomThemeSchemeConfig{customSchemesDraft[idx]}); err != nil {
+				dialog.ShowError(err, w)
+				return false
+			}
+			customSchemesDraft = normalizeCustomThemeSchemes(customSchemesDraft)
+			refreshCustomSchemeSelect()
+			refreshThemeSchemeSelect()
+			loadCustomEditor(selectedCustomThemeID)
+			return true
+		}
+		openThemeColorPicker := func(title string, entry *widget.Entry) {
+			initial, ok := colorFromThemeHex(entry.Text)
+			if !ok {
+				initial = color.NRGBA{255, 255, 255, 255}
+			}
+			picker := dialog.NewColorPicker(title, "选择颜色", func(c color.Color) {
+				entry.SetText(hexFromColor(c))
+			}, w)
+			picker.Advanced = true
+			picker.SetColor(initial)
+			picker.Show()
+		}
+		colorEntryRow := func(label string, entry *widget.Entry) fyne.CanvasObject {
+			pickBtn := widget.NewButton("选择", func() {
+				openThemeColorPicker(label, entry)
+			})
+			return container.NewBorder(nil, nil, widget.NewLabel(label), pickBtn, entry)
+		}
+		customColorGrid := container.NewGridWithColumns(2,
+			colorEntryRow("主色", customPrimaryEntry),
+			colorEntryRow("背景", customBackgroundEntry),
+			colorEntryRow("按钮", customButtonEntry),
+			colorEntryRow("表头", customHeaderEntry),
+		)
+		newCustomBtn := widget.NewButton("新增方案", func() {
+			updateCustomDraftFromFields()
+			usedIDs := map[string]bool{}
+			usedNames := map[string]bool{}
+			for _, scheme := range customSchemesDraft {
+				usedIDs[scheme.ID] = true
+				if strings.TrimSpace(scheme.Name) != "" {
+					usedNames[strings.TrimSpace(scheme.Name)] = true
+				}
+			}
+			mode := themeModeFromDisplay(themeModeSelect.Selected)
+			palette := themePaletteForWithCustom(selectedThemeSchemeID, themeModeIsDark(mode, a.Settings().ThemeVariant()), customSchemesDraft)
+			scheme := CustomThemeSchemeConfig{
+				ID:               nextCustomThemeSchemeID(usedIDs),
+				Name:             uniqueCustomThemeSchemeName("", len(customSchemesDraft)+1, usedNames),
+				Primary:          hexFromColor(palette.Primary),
+				Background:       hexFromColor(palette.Background),
+				Button:           hexFromColor(palette.Button),
+				HeaderBackground: hexFromColor(palette.HeaderBackground),
+			}
+			customSchemesDraft = append(customSchemesDraft, scheme)
+			selectedCustomThemeID = scheme.ID
+			selectedThemeSchemeID = scheme.ID
+			refreshCustomSchemeSelect()
+			refreshThemeSchemeSelect()
+			loadCustomEditor(scheme.ID)
+		})
+		updateCustomBtn = widget.NewButton("更新方案", func() {
+			applyCustomEditor()
+		})
+		deleteCustomBtn = widget.NewButton("删除方案", func() {
+			idx := findCustomSchemeIndex(selectedCustomThemeID)
+			if idx < 0 {
+				return
+			}
+			deletedID := customSchemesDraft[idx].ID
+			customSchemesDraft = append(customSchemesDraft[:idx], customSchemesDraft[idx+1:]...)
+			if selectedThemeSchemeID == deletedID {
+				selectedThemeSchemeID = appThemeSchemeClassicBlue
+			}
+			selectedCustomThemeID = ""
+			refreshCustomSchemeSelect()
+			refreshThemeSchemeSelect()
+			loadCustomEditor("")
+		})
+		customSchemeSelect.OnChanged = func(display string) {
+			loadCustomEditor(customSchemeIDFromDisplay(display))
+		}
+		themeModeSelect.OnChanged = func(string) {
+			refreshThemePreview()
+		}
+		themeSchemeSelect.OnChanged = func(display string) {
+			selectedThemeSchemeID = themeSchemeFromDisplayFor(display, customSchemesDraft)
+			refreshThemePreview()
+		}
+		if len(customSchemesDraft) > 0 {
+			selectedCustomThemeID = customSchemesDraft[0].ID
+		}
+		refreshCustomSchemeSelect()
+		loadCustomEditor(selectedCustomThemeID)
+		refreshThemePreview()
+
+		colsEntry := widget.NewEntry()
+		colsEntry.SetText(fmt.Sprintf("%d", gridColsValue))
+		rowsEntry := widget.NewEntry()
+		rowsEntry.SetText(fmt.Sprintf("%d", gridRowsValue))
+		spacingEntry := widget.NewEntry()
+		spacingEntry.SetText(fmt.Sprintf("%d", gridSpacingValue))
+
+		parsePositiveInt := func(label, value string) (int, bool) {
+			parsed, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || parsed <= 0 {
+				dialog.ShowError(fmt.Errorf("%s需要输入大于 0 的整数", label), w)
+				return 0, false
+			}
+			return parsed, true
+		}
+		numberRow := func(label string, entry *widget.Entry) fyne.CanvasObject {
+			minusBtn := widget.NewButton("-", func() {
+				if val, err := strconv.Atoi(strings.TrimSpace(entry.Text)); err == nil && val > 1 {
+					entry.SetText(fmt.Sprintf("%d", val-1))
+				}
+			})
+			plusBtn := widget.NewButton("+", func() {
+				if val, err := strconv.Atoi(strings.TrimSpace(entry.Text)); err == nil {
+					entry.SetText(fmt.Sprintf("%d", val+1))
+				}
+			})
+			stepBtns := container.NewGridWithColumns(2, minusBtn, plusBtn)
+			return container.NewBorder(nil, nil, widget.NewLabel(label), stepBtns, entry)
+		}
+
+		systemConfigPanel := container.NewVBox(
+			widget.NewLabelWithStyle("系统配置", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewLabel("配置应用级行为。保存后立即生效。"),
+			widget.NewSeparator(),
+			widget.NewLabelWithStyle("日志功能", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			logEnabledCheck,
+			logPathLabel,
+			widget.NewSeparator(),
+			remoteScreenshotPanel,
+			widget.NewSeparator(),
+			autoSaveScreenshotPanel,
+			widget.NewSeparator(),
+			widget.NewLabelWithStyle("配色管理", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewLabel("主题按钮会在所有内置和自定义配色方案间循环切换；亮暗模式仍可单独设置。"),
+			container.NewBorder(nil, nil, widget.NewLabel("亮暗模式"), nil, themeModeSelect),
+			container.NewBorder(nil, nil, widget.NewLabel("配色方案"), nil, themeSchemeSelect),
+			container.NewBorder(nil, nil, widget.NewLabel("方案预览"), nil, themePreviewRow),
+			widget.NewSeparator(),
+			widget.NewLabelWithStyle("自定义配色", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewLabel("可新增多个自定义方案，并设置主色、背景、按钮、表头。颜色格式：#RRGGBB。"),
+			container.NewBorder(nil, nil, widget.NewLabel("自定义方案"), container.NewHBox(newCustomBtn, updateCustomBtn, deleteCustomBtn), customSchemeSelect),
+			container.NewBorder(nil, nil, widget.NewLabel("方案名称"), nil, customNameEntry),
+			customColorGrid,
+		)
+
+		gridConfigPanel := container.NewVBox(
+			widget.NewLabelWithStyle("点阵参数设置", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewLabel("配置点阵模式生成取色点时使用的列数、行数和间距。"),
+			widget.NewSeparator(),
+			numberRow("列数", colsEntry),
+			numberRow("行数", rowsEntry),
+			numberRow("间距", spacingEntry),
+		)
+
+		commands := commandsForSettings()
+		shortcutEntries := make(map[string]*shortcutCaptureEntry, len(commands))
+		shortcutRows := container.NewVBox(
+			widget.NewLabelWithStyle("快捷键管理", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewLabel("点击快捷键框后直接按组合键自动录入；Backspace、Delete 或 Escape 清空该快捷键。"),
+			widget.NewSeparator(),
+		)
+		currentShortcutGroup := ""
+		for _, command := range commands {
+			group := shortcutSettingsGroup(command)
+			if group != currentShortcutGroup {
+				if currentShortcutGroup != "" {
+					shortcutRows.Add(widget.NewSeparator())
+				}
+				shortcutRows.Add(widget.NewLabelWithStyle(group, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+				currentShortcutGroup = group
+			}
+			entry := newShortcutCaptureEntry()
+			entry.SetText(shortcutTextFor(command.id))
+			shortcutEntries[command.id] = entry
+			defaultBtn := widget.NewButton("默认", func(id string, target *shortcutCaptureEntry) func() {
+				return func() {
+					target.SetText(defaultShortcutTexts[id])
+				}
+			}(command.id, entry))
+			rowLabel := widget.NewLabel(command.label)
+			row := container.NewBorder(nil, nil, rowLabel, defaultBtn, entry)
+			shortcutRows.Add(row)
+		}
+
+		copyValueButton := func(label, value string) *widget.Button {
+			btn := widget.NewButton(label+"："+value, func() {
+				w.Clipboard().SetContent(value)
+				dialog.ShowInformation("已复制", label+"已复制到剪贴板。", w)
+			})
+			btn.Alignment = widget.ButtonAlignLeading
+			btn.Importance = widget.LowImportance
+			return btn
+		}
+		emailRow := copyValueButton("邮箱", aboutContactEmail)
+		projectURLRow := copyValueButton("项目地址", aboutProjectURL)
+		releaseNotesLabel := widget.NewLabel(aboutReleaseNotes)
+		releaseNotesLabel.Wrapping = fyne.TextWrapWord
+		releaseNotesScroll := container.NewVScroll(container.NewPadded(releaseNotesLabel))
+		releaseNotesBox := widget.NewCard("", "", newFixedHeightContainer(releaseNotesScroll, 260))
+		checkUpdateBtn := widget.NewButtonWithIcon("检查更新", theme.ViewRefreshIcon(), func() {
+			dialog.ShowInformation("检查更新", "检查更新功能预留中，后续可在这里对接软件更新。", w)
+		})
+		aboutTitle := widget.NewLabelWithStyle("关于软件", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+		aboutPanel := container.NewVBox(
+			container.NewBorder(nil, nil, aboutTitle, checkUpdateBtn),
+			widget.NewLabel("软件联系方式与项目地址。"),
+			widget.NewSeparator(),
+			widget.NewLabel("当前版本："+aboutCurrentVersion),
+			widget.NewLabel("最新版本："+aboutLatestVersion),
+			widget.NewSeparator(),
+			emailRow,
+			projectURLRow,
+			widget.NewSeparator(),
+			widget.NewLabelWithStyle("版本更新日志", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			container.New(&fixedContentWidthLayout{width: 560}, releaseNotesBox),
+		)
+
+		rightPanel := container.NewMax()
+		scrollSection := func(content fyne.CanvasObject) fyne.CanvasObject {
+			return container.NewVScroll(container.NewPadded(content))
+		}
+		sections := []struct {
+			title   string
+			content fyne.CanvasObject
+		}{
+			{title: "系统配置", content: scrollSection(systemConfigPanel)},
+			{title: "点阵参数设置", content: scrollSection(gridConfigPanel)},
+			{title: "快捷键管理", content: scrollSection(shortcutRows)},
+			{title: "关于软件", content: scrollSection(aboutPanel)},
+		}
+		selectSection := func(id int) {
+			if id < 0 || id >= len(sections) {
+				return
+			}
+			rightPanel.Objects = []fyne.CanvasObject{sections[id].content}
+			rightPanel.Refresh()
+		}
+		sectionList := widget.NewList(
+			func() int { return len(sections) },
+			func() fyne.CanvasObject {
+				return widget.NewLabel("")
+			},
+			func(id widget.ListItemID, item fyne.CanvasObject) {
+				item.(*widget.Label).SetText(sections[id].title)
+			},
+		)
+		sectionList.OnSelected = func(id widget.ListItemID) {
+			selectSection(id)
+		}
+		selectSection(0)
+		sectionList.Select(0)
+
+		body := container.NewHSplit(
+			container.New(&fixedContentWidthLayout{width: 150}, sectionList),
+			rightPanel,
+		)
+		body.Offset = 0.28
+
+		var configDialog dialog.Dialog
+		saveBtn := widget.NewButtonWithIcon("保存", theme.DocumentSaveIcon(), func() {
+			newShortcuts := copyShortcutConfig(shortcutConfig)
+			seenShortcuts := make(map[string]string)
+			for _, command := range commands {
+				entry := shortcutEntries[command.id]
+				if entry == nil {
+					continue
+				}
+				shortcut, formatted, err := parseShortcutText(entry.Text)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("%s：%v", command.label, err), w)
+					return
+				}
+				if shortcut != nil {
+					shortcutName := shortcut.ShortcutName()
+					if previousLabel, ok := seenShortcuts[shortcutName]; ok {
+						dialog.ShowError(fmt.Errorf("%s 和 %s 使用了相同快捷键", previousLabel, command.label), w)
+						return
+					}
+					seenShortcuts[shortcutName] = command.label
+				}
+				newShortcuts[command.id] = formatted
+			}
+
+			cols, ok := parsePositiveInt("列数", colsEntry.Text)
+			if !ok {
+				return
+			}
+			rows, ok := parsePositiveInt("行数", rowsEntry.Text)
+			if !ok {
+				return
+			}
+			spacing, ok := parsePositiveInt("间距", spacingEntry.Text)
+			if !ok {
+				return
+			}
+			remotePort, err := strconv.Atoi(strings.TrimSpace(remotePortEntry.Text))
+			if err != nil || remotePort < 1 || remotePort > 65535 {
+				dialog.ShowError(fmt.Errorf("远程监听端口需要输入 1 到 65535 之间的整数"), w)
+				return
+			}
+			saveScreenshotPath := strings.TrimSpace(screenshotSavePathEntry.Text)
+			if autoSaveScreenshotCheck.Checked && saveScreenshotPath == "" {
+				dialog.ShowError(fmt.Errorf("截图自动保存目录不能为空"), w)
+				return
+			}
+			if saveScreenshotPath == "" {
+				saveScreenshotPath = defaultScreenshotSavePath
+			}
+			if screenshotSourceIsRemote() {
+				if err := remoteScreenshotServer.Start(remotePort); err != nil {
+					dialog.ShowError(err, w)
+					return
+				}
+			}
+			remoteScreenshotPort = remotePort
+			autoSaveScreenshot = autoSaveScreenshotCheck.Checked
+			screenshotSavePath = saveScreenshotPath
+			if refreshRemoteStatus != nil {
+				refreshRemoteStatus()
+			}
+
+			updateCustomDraftFromFields()
+			if err := validateCustomThemeSchemes(customSchemesDraft); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+
+			gridColsValue = cols
+			gridRowsValue = rows
+			gridSpacingValue = spacing
+			shortcutConfig = normalizeShortcutConfig(newShortcuts)
+			setAppLoggingEnabled(logEnabledCheck.Checked)
+			applyThemeSettings(themeModeFromDisplay(themeModeSelect.Selected), selectedThemeSchemeID, customSchemesDraft)
+			registerConfiguredShortcuts()
+			shortcutsRestored = true
+			if refreshShortcutButtonTexts != nil {
+				refreshShortcutButtonTexts()
+			}
+			log.Printf("点阵参数已更新: %dx%d/%d", gridColsValue, gridRowsValue, gridSpacingValue)
+			if saveCurrentConfig != nil {
+				saveCurrentConfig()
+			}
+			configDialog.Hide()
+		})
+		saveBtn.Importance = widget.HighImportance
+		closeBtn := widget.NewButton("取消", func() {
+			configDialog.Hide()
+		})
+		content := container.NewBorder(nil, container.NewHBox(layout.NewSpacer(), closeBtn, saveBtn), nil, nil, body)
+		configDialog = dialog.NewCustomWithoutButtons("系统配置", content, w)
+		configDialog.SetOnClosed(restoreDialogShortcuts)
+		configDialog.Resize(fyne.NewSize(820, 560))
+		configDialog.Show()
+	}
+	gridSettingsBtn := widget.NewButtonWithIcon("系统", theme.SettingsIcon(), openSystemConfigDialog)
+
+	// 使用Border布局，然后用固定高度容器包装（高度设为35）
+	gridRowBorder := container.NewBorder(nil, nil, nil, gridSettingsBtn, gridModeBtn)
+	gridRow := newFixedHeightContainer(gridRowBorder, 35)
+
+	// 如果imageViewer已经存在（不为nil），设置回调
+	if imageViewer != nil {
+		configureImageViewer(imageViewer)
+	}
+
+	// 左侧工具栏布局：模拟 AutoGo 工具面板的窄栏按钮布局
+	makeEntry := func(text string) *widget.Entry {
+		entry := widget.NewEntry()
+		entry.SetText(text)
+		return entry
+	}
+	var rightTabs *container.AppTabs
+	var nodeTabItem *container.TabItem
+	nodeTool := newAndroidNodeTool(w, func() string {
+		return selectedAndroidDeviceID()
+	}, func() *ImageViewer {
+		return imageViewer
+	}, openNodeImageTab, func(selectedFunction string, onSaved func()) {
+		showAPIFormatDialog(w, selectedFunction, func() {
+			if saveCurrentConfig != nil {
+				saveCurrentConfig()
+			}
+			if onSaved != nil {
+				onSaved()
+			}
+		})
+	})
+	nodeTool.SetOnOpen(func() {
+		if selectNodeToolTab != nil {
+			selectNodeToolTab()
+		}
+	})
+	appInfoTool := newAndroidAppInfoTool(w, func() string {
+		return selectedAndroidDeviceID()
+	})
+	registerCommand(commandNodeCaptureSimple, nodeTool.CaptureSimple)
+	registerCommand(commandNodeSearch, nodeTool.Search)
+	registerCommand(commandNodePrevious, nodeTool.SelectPrevious)
+	registerCommand(commandNodeNext, nodeTool.SelectNext)
+	registerCommand(commandNodeSelectAll, nodeTool.SelectAllAttrs)
+	registerCommand(commandNodeClearSelected, nodeTool.ClearSelectedAttrs)
+	registerCommand(commandNodeTestSelector, nodeTool.TestSelector)
+	registerCommand(commandNodeGenerateCode, nodeTool.GenerateSelectorCode)
+	registerCommand(commandNodeCopyCode, nodeTool.CopySelectorCode)
+	registerCommand(commandNodeCopyParams, nodeTool.CopySelectorParams)
+	registerCommand(commandNodeFormat, nodeTool.OpenFormatSettings)
+	registerCommand(commandAppInfoQuery, appInfoTool.Query)
+	registerCommand(commandAppInfoCopyName, appInfoTool.CopyName)
+	registerCommand(commandAppInfoCopyPkg, appInfoTool.CopyPackage)
+	registerCommand(commandAppInfoCopyLaunch, appInfoTool.CopyLauncher)
+	registerCommand(commandAppInfoCopyActs, appInfoTool.CopyActivities)
+	grabNodeBtn := widget.NewButton("抓取节点", func() {
+		nodeTool.Capture()
+	})
+	grabNodeBtn.Importance = widget.MediumImportance
+	registerCommand(commandGrabNode, func() {
+		nodeTool.Capture()
+	})
+	makeFixedPanel := func(width float32, content fyne.CanvasObject) *fyne.Container {
+		minWidth := canvas.NewRectangle(color.Transparent)
+		minWidth.SetMinSize(fyne.NewSize(width, 1))
+		return container.NewStack(minWidth, content)
+	}
+	makeFixedWidthPanel := func(width float32, content fyne.CanvasObject) *fyne.Container {
+		return container.New(&fixedWidthLayout{width: width}, content)
+	}
+
+	showMagnifierCheck := widget.NewCheck("放大镜", func(checked bool) {
+		magnifierEnabled = checked
+		if !checked && imageViewer != nil && imageViewer.magnifier != nil {
+			imageViewer.magnifier.Hide()
+		}
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	})
+	showMagnifierCheck.SetChecked(userConfig.ShowMagnifier)
+	magnifierThemeRow := container.NewBorder(nil, nil, nil, themeBtn, showMagnifierCheck)
+
+	screenshotBtn.button.SetText(buttonTextWithShortcut("截图", shortcutActionScreenshot))
+	importBtn.SetText(buttonTextWithShortcut("加载", shortcutActionImport))
+
+	rotateLeftBtn := widget.NewButtonWithIcon("", theme.ContentUndoIcon(), func() {
+		if imageViewer == nil || imageViewer.originalImage == nil {
+			return
+		}
+		imageViewer.RotateImage((imageViewer.rotationDegrees + 270) % 360)
+	})
+	rotateRightBtn := widget.NewButtonWithIcon("", theme.ContentRedoIcon(), func() {
+		if imageViewer == nil || imageViewer.originalImage == nil {
+			return
+		}
+		imageViewer.RotateImage((imageViewer.rotationDegrees + 90) % 360)
+	})
+	rotateRow := container.NewGridWithColumns(2, rotateLeftBtn, rotateRightBtn)
+
+	toggleRangeSelect := func() {
+		if imageViewer == nil || imageViewer.image == nil {
+			return
+		}
+		imageViewer.SetRangeSelectMode(!imageViewer.rangeSelectMode)
+	}
+	rangeBtn := widget.NewButton("范围 (CTRL+R)", toggleRangeSelect)
+	registerCommand(shortcutActionRange, toggleRangeSelect)
+	updateRangeButton = func() {
+		if imageViewer != nil && imageViewer.rangeSelectMode {
+			rangeBtn.SetText("选择范围中...")
+			rangeBtn.Importance = widget.HighImportance
+		} else {
+			rangeBtn.SetText(buttonTextWithShortcut("范围", shortcutActionRange))
+			rangeBtn.Importance = widget.MediumImportance
+		}
+		rangeBtn.Refresh()
+	}
+	updateRangeButton()
+
+	rectCoordEntry.SetText(defaultRangeText)
+	coordDisplayEntry := rectCoordEntry
+	copyRange := func() {
+		w.Clipboard().SetContent(coordDisplayEntry.Text)
+	}
+	resetRange := func() {
+		if imageViewer != nil {
+			imageViewer.ResetRangeSelection()
+			return
+		}
+		setRectCoordText(defaultRangeText)
+	}
+	registerCommand(commandCopyRange, copyRange)
+	registerCommand(commandResetRange, resetRange)
+	copyResetRow := container.NewGridWithColumns(2, widget.NewButton("复制", copyRange), widget.NewButton("重置", resetRange))
+	resetZoom := func() {
+		if imageViewer != nil {
+			imageViewer.FitToView()
+		}
+	}
+	resetZoomBtn := widget.NewButton("重置缩放", resetZoom)
+	registerCommand(commandResetZoom, resetZoom)
+	showOriginalSize := func() {
+		if imageViewer != nil {
+			imageViewer.ShowOriginalSize()
+		}
+	}
+	originalSizeBtn := widget.NewButton("显示原始尺寸", showOriginalSize)
+	registerCommand(commandOriginalSize, showOriginalSize)
+	clearFindMarks := func() {
+		if imageViewer != nil {
+			imageViewer.ClearFindTestHighlights()
+		}
+	}
+	clearFindMarksBtn := widget.NewButton("清除查找标记", clearFindMarks)
+	clearFindMarksBtn.Importance = widget.MediumImportance
+	registerCommand(commandClearFindMarks, clearFindMarks)
+
+	pickModeSelect := widget.NewSelect(pickModeOptions, func(string) {
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	})
+	pickModeSelect.SetSelected(userConfig.PickMode)
+	pickCountEntry := makeEntry(userConfig.PickCount)
+	pickCountEntry.OnChanged = func(string) {
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+	startAutoPick := func() {
+		if imageViewer == nil || imageViewer.image == nil {
+			dialog.ShowInformation("提示", "请先加载或截图后再自动取色", w)
+			return
+		}
+
+		mode := strings.TrimSpace(pickModeSelect.Selected)
+		if mode == "" {
+			mode = autoPickModeRandom
+		}
+		if !supportedAutoPickMode(mode) {
+			dialog.ShowInformation("提示", fmt.Sprintf("当前仅已实现「%s」、「%s」、「%s」、「%s」、「%s」和「%s」模式", autoPickModeRandom, autoPickModeContour, autoPickModeHighlight, autoPickModeHighSaturation, autoPickModeColorClassContour, autoPickModeColorClassRandom), w)
+			return
+		}
+
+		count := parsePickCount(pickCountEntry.Text)
+		if count <= 0 {
+			dialog.ShowInformation("提示", "取色个数需要大于 0", w)
+			return
+		}
+
+		viewer := imageViewer
+		viewer.SetRangeSelectModeWithCallback(func(rect image.Rectangle) {
+			if imageViewer != viewer || viewer.image == nil {
+				dialog.ShowInformation("自动取色", "当前图像已切换，请重新框选", w)
+				return
+			}
+
+			rect = normalizePickRect(viewer.image, rect)
+			if rect.Empty() {
+				dialog.ShowInformation("自动取色", "选择的取色区域无效", w)
+				return
+			}
+
+			message := fmt.Sprintf(
+				"确认在区域 %d,%d,%d,%d 内按「%s」生成 %d 个取色点？",
+				rect.Min.X, rect.Min.Y, rect.Max.X-1, rect.Max.Y-1, mode, count,
+			)
+			applyAutoPick := func(clearExisting bool) {
+				if imageViewer != viewer || viewer.image == nil {
+					dialog.ShowInformation("自动取色", "当前图像已切换，请重新框选", w)
+					return
+				}
+
+				points := autoPickPoints(autoPickRequest{
+					Image: viewer.image,
+					Rect:  rect,
+					Count: count,
+					Mode:  mode,
+				})
+				if len(points) == 0 {
+					dialog.ShowInformation("自动取色", "未生成取色点，请尝试扩大选区或降低取色个数", w)
+					return
+				}
+				if clearExisting {
+					viewer.ReplacePoints(points)
+					return
+				}
+				viewer.AddPoints(points)
+			}
+
+			autoPickDialog := dialog.NewCustom("自动取色", "取消", widget.NewLabel(message), w)
+			cancelBtn := widget.NewButtonWithIcon("取消", theme.CancelIcon(), func() {
+				autoPickDialog.Hide()
+			})
+			clearConfirmBtn := widget.NewButton("清空并确认", func() {
+				autoPickDialog.Hide()
+				applyAutoPick(true)
+			})
+			confirmBtn := widget.NewButtonWithIcon("确认", theme.ConfirmIcon(), func() {
+				autoPickDialog.Hide()
+				applyAutoPick(false)
+			})
+			confirmBtn.Importance = widget.HighImportance
+			autoPickDialog.SetButtons([]fyne.CanvasObject{cancelBtn, clearConfirmBtn, confirmBtn})
+			autoPickDialog.Show()
+		})
+	}
+	autoPickBtn := widget.NewButton(buttonTextWithShortcut("自动取色", shortcutActionAutoPick), startAutoPick)
+	autoPickBtn.Importance = widget.MediumImportance
+	registerCommand(shortcutActionAutoPick, startAutoPick)
+	applyRangeCheck := widget.NewCheck("选取后应用范围", func(bool) {
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	})
+	applyRangeCheck.SetChecked(userConfig.ApplyRange)
+	autoCopyRangeCheck := widget.NewCheck("自动复制范围", func(checked bool) {
+		autoCopyRangeEnabled = checked
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	})
+	autoCopyRangeCheck.SetChecked(autoCopyRangeEnabled)
+
+	displaySelectBox := container.New(&fixedWidthLayout{width: 64}, displaySelect)
+	deviceDisplayRow := container.NewBorder(nil, nil, nil, displaySelectBox, deviceSelect)
+	remoteStatusLabel = widget.NewLabel("远程服务未启动")
+	remoteStatusLabel.Wrapping = fyne.TextWrapWord
+	applyingScreenshotSource := false
+	refreshRemoteStatus = func() {
+		if remoteStatusLabel == nil {
+			return
+		}
+		status := remoteScreenshotServer.Status()
+		switch {
+		case !status.Running:
+			remoteStatusLabel.SetText("远程服务未启动")
+		case status.Online():
+			name := status.DeviceName
+			if name == "" {
+				name = status.DeviceID
+			}
+			remoteStatusLabel.SetText(fmt.Sprintf("远程已连接: %s", name))
+		default:
+			remoteStatusLabel.SetText(fmt.Sprintf("远程服务监听中: %d，等待设备", status.Port))
+		}
+		remoteStatusLabel.Refresh()
+	}
+	applyScreenshotSource = func(source string, showError bool) {
+		if applyingScreenshotSource {
+			return
+		}
+		applyingScreenshotSource = true
+		defer func() {
+			applyingScreenshotSource = false
+		}()
+
+		source = normalizeScreenshotSource(source)
+		if source == screenshotSourceRemote {
+			if err := remoteScreenshotServer.Start(remoteScreenshotPort); err != nil {
+				remoteScreenshotActive.Store(false)
+				screenshotSourceSelect.SetSelected(screenshotSourceDisplay(screenshotSourceADB))
+				deviceSelect.Enable()
+				displaySelect.Enable()
+				refreshRemoteStatus()
+				if showError {
+					dialog.ShowError(err, w)
+				}
+				return
+			}
+			remoteScreenshotActive.Store(true)
+			deviceSelect.Disable()
+			displaySelect.Disable()
+		} else {
+			remoteScreenshotActive.Store(false)
+			remoteScreenshotServer.Stop()
+			deviceSelect.Enable()
+			displaySelect.Enable()
+			go updateDeviceList()
+		}
+		refreshRemoteStatus()
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+	screenshotSourceSelect = widget.NewSelect([]string{
+		screenshotSourceDisplay(screenshotSourceADB),
+		screenshotSourceDisplay(screenshotSourceRemote),
+	}, func(value string) {
+		if applyingScreenshotSource || applyScreenshotSource == nil {
+			return
+		}
+		applyScreenshotSource(screenshotSourceFromDisplay(value), true)
+	})
+	screenshotSourceSelect.SetSelected(screenshotSourceDisplay(userConfig.ScreenshotSource))
+	applyScreenshotSource(userConfig.ScreenshotSource, false)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if refreshRemoteStatus != nil {
+					fyne.Do(refreshRemoteStatus)
+				}
+			case <-remoteStatusStop:
+				return
+			}
+		}
+	}()
+
+	leftControls := container.NewVBox(
+		gridRow,
+		deviceDisplayRow,
+		container.NewBorder(nil, nil, widget.NewLabel("截图来源"), nil, screenshotSourceSelect),
+		remoteStatusLabel,
+		magnifierThemeRow,
+		screenshotBtn,
+		rotateRow,
+		importBtn,
+		rangeBtn,
+		coordDisplayEntry,
+		copyResetRow,
+		resetZoomBtn,
+		originalSizeBtn,
+		grabNodeBtn,
+		clearFindMarksBtn,
+		autoPickBtn,
+		pickModeSelect,
+		container.NewBorder(nil, nil, widget.NewLabel("取色个数"), nil, pickCountEntry),
+		applyRangeCheck,
+		autoCopyRangeCheck,
+	)
+	const (
+		leftPanelWidth     float32 = 190
+		rightPanelMinWidth float32 = 260
+	)
+	leftPanel := makeFixedWidthPanel(leftPanelWidth, container.New(&compactPaddedLayout{padding: 2}, container.NewVScroll(container.New(&fixedContentWidthLayout{width: 170}, leftControls))))
+
+	// 右侧工具栏布局：模拟图色工具 / 节点工具面板
+	headerBg = canvas.NewRectangle(getHeaderBgColor(isDarkTheme))
+	headerBg.SetMinSize(fyne.NewSize(rightPanelMinWidth, 28))
+
+	idHeader = canvas.NewText("", getTextColor(isDarkTheme))
+	checkHeader := canvas.NewText("勾选", getTextColor(isDarkTheme))
+	posHeader = canvas.NewText("坐标", getTextColor(isDarkTheme))
+	colorHeader = canvas.NewText("取色", getTextColor(isDarkTheme))
+	statusHeader = canvas.NewText("RGB", getTextColor(isDarkTheme))
+	offsetHeader := canvas.NewText("偏色", getTextColor(isDarkTheme))
+	for _, header := range []*canvas.Text{idHeader, checkHeader, posHeader, colorHeader, statusHeader, offsetHeader} {
+		header.Alignment = fyne.TextAlignCenter
+		header.TextSize = 12
+		header.TextStyle = fyne.TextStyle{Bold: true}
+	}
+
+	tableHeader = container.NewStack(headerBg, container.New(&weightedGridLayout{
+		cols:    6,
+		weights: []float32{0.55, 1.0, 1.7, 1.6, 2.0, 1.45},
+	},
+		container.NewCenter(idHeader),
+		container.NewCenter(checkHeader),
+		container.NewCenter(posHeader),
+		container.NewCenter(colorHeader),
+		container.NewCenter(statusHeader),
+		container.NewCenter(offsetHeader),
+	))
+
+	updateTableHeader = func() {
+		headerBg.FillColor = getHeaderBgColor(isDarkTheme)
+		headerBg.Refresh()
+		textColor := getContrastColor(headerBg.FillColor)
+		for _, header := range []*canvas.Text{idHeader, checkHeader, posHeader, colorHeader, statusHeader, offsetHeader} {
+			header.Color = textColor
+			header.Refresh()
+		}
+	}
+
+	updateTableSelection = func() {
+		fyne.Do(func() {
+			refreshLinkedColorPointVisual()
+			if tableContent != nil {
+				tableContent.Refresh()
+			}
+			refreshImagesAPIFields()
+		})
+	}
+
+	tableContent = widget.NewList(
+		func() int {
+			if len(colorPoints) > colorPointTableVisibleRows {
+				return len(colorPoints)
+			}
+			return colorPointTableVisibleRows
+		},
+		func() fyne.CanvasObject {
+			idxText := canvas.NewText("", getTextColor(isDarkTheme))
+			idxText.Alignment = fyne.TextAlignCenter
+			idxText.TextSize = 11
+
+			statusCheck := NewColorCheck(false, color.RGBA{240, 240, 240, 255}, func(bool) {})
+			coordEntry := newCommitEntry()
+
+			swatch := canvas.NewRectangle(color.Black)
+			swatch.SetMinSize(fyne.NewSize(56, 24))
+
+			rgbText := canvas.NewText("", getTextColor(isDarkTheme))
+			rgbText.Alignment = fyne.TextAlignCenter
+			rgbText.TextSize = 11
+			offsetEntry := newCommitEntry()
+
+			rowContent := container.New(&weightedGridLayout{
+				cols:    6,
+				weights: []float32{0.55, 1.0, 1.7, 1.6, 2.0, 1.45},
+			},
+				container.NewCenter(idxText),
+				container.NewCenter(statusCheck),
+				coordEntry,
+				container.NewPadded(swatch),
+				container.NewCenter(rgbText),
+				offsetEntry,
+			)
+			return newClickableTableRow(transparent, rowContent, nil)
+		},
+		func(id widget.ListItemID, item fyne.CanvasObject) {
+			row := item.(*ClickableTableRow)
+			rowContent := row.content
+			idxText := rowContent.Objects[0].(*fyne.Container).Objects[0].(*canvas.Text)
+			statusCheck := rowContent.Objects[1].(*fyne.Container).Objects[0].(*ColorCheck)
+			coordEntry := rowContent.Objects[2].(*commitEntry)
+			swatch := rowContent.Objects[3].(*fyne.Container).Objects[0].(*canvas.Rectangle)
+			rgbText := rowContent.Objects[4].(*fyne.Container).Objects[0].(*canvas.Text)
+			offsetEntry := rowContent.Objects[5].(*commitEntry)
+
+			textColor := getTextColor(isDarkTheme)
+			idxText.Color = textColor
+			rgbText.Color = textColor
+			idxText.Text = strconv.Itoa(id + 1)
+			row.id = id
+			row.onDoubleTap = nil
+			row.background.FillColor = linkedColorPointRowBackground(id)
+
+			if id < len(colorPoints) {
+				point := colorPoints[id]
+				row.onDoubleTap = func() {
+					activateLinkedColorPoint(id)
+				}
+				coordEntry.Enable()
+				coordEntry.onCommit = func(value string) {
+					commitColorPointPosition(id, value)
+				}
+				coordEntry.OnSubmitted = coordEntry.onCommit
+				coordEntry.SetText(point.Position)
+				rgbText.Text = point.Color
+				offsetEntry.Enable()
+				offsetEntry.onCommit = func(value string) {
+					if id >= len(colorPoints) {
+						return
+					}
+					colorPoints[id].Offset = strings.TrimSpace(value)
+					updateTableSelection()
+				}
+				offsetEntry.OnSubmitted = offsetEntry.onCommit
+				offsetEntry.SetText(point.Offset)
+				swatch.FillColor = hexToColor(point.Color)
+				statusCheck.Color = hexToColor(point.Color)
+				statusCheck.Checked = point.Selected
+				statusCheck.OnChanged = func(checked bool) {
+					if id >= len(colorPoints) {
+						return
+					}
+					colorPoints[id].Selected = checked
+					updateTableSelection()
+				}
+			} else {
+				coordEntry.onCommit = nil
+				coordEntry.OnSubmitted = nil
+				coordEntry.SetText("")
+				coordEntry.Disable()
+				rgbText.Text = ""
+				offsetEntry.onCommit = nil
+				offsetEntry.OnSubmitted = nil
+				offsetEntry.SetText("")
+				offsetEntry.Disable()
+				swatch.FillColor = color.Black
+				statusCheck.Color = color.RGBA{240, 240, 240, 255}
+				statusCheck.Checked = false
+				statusCheck.OnChanged = func(bool) {}
+			}
+
+			row.background.Refresh()
+			idxText.Refresh()
+			coordEntry.Refresh()
+			rgbText.Refresh()
+			offsetEntry.Refresh()
+			swatch.Refresh()
+			statusCheck.Refresh()
+		},
+	)
+	tableScroll := container.NewVScroll(tableContent)
+	tableBlock := container.NewBorder(tableHeader, nil, nil, nil, tableScroll)
+
+	clearAllPoints := func() {
+		w.Canvas().Unfocus()
+		if imageViewer != nil {
+			imageViewer.ClearMarks()
+			return
+		}
+		colorPoints = colorPoints[:0]
+		updateTableSelection()
+	}
+	registerCommand(shortcutActionClearAll, clearAllPoints)
+	clearAllBtn := widget.NewButton("清空", clearAllPoints)
+	uniformOffsetEntry := makeEntry(userConfig.UniformOffset)
+	uniformOffsetEntry.OnChanged = func(value string) {
+		defaultColorPointOffset = strings.TrimSpace(value)
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+	defaultColorPointOffset = strings.TrimSpace(uniformOffsetEntry.Text)
+	copyCoords := func() {
+		w.Canvas().Unfocus()
+		w.Clipboard().SetContent(colorPointCoordinatesText())
+	}
+	registerCommand(commandCopyCoords, copyCoords)
+	copyCoordsBtn := widget.NewButton("复制坐标", copyCoords)
+	pasteCoords := func() {
+		w.Canvas().Unfocus()
+		points := parsePointPositionsText(w.Clipboard().Content())
+		if len(points) == 0 {
+			return
+		}
+		defaultColorPointOffset = strings.TrimSpace(uniformOffsetEntry.Text)
+		replaceColorPointsByPositions(points, defaultColorPointOffset)
+	}
+	registerCommand(commandPasteCoords, pasteCoords)
+	pasteCoordsBtn := widget.NewButton("粘贴坐标", pasteCoords)
+	applyUniformOffset := func() {
+		defaultColorPointOffset = strings.TrimSpace(uniformOffsetEntry.Text)
+		for i := range colorPoints {
+			colorPoints[i].Offset = defaultColorPointOffset
+		}
+		updateTableSelection()
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+	registerCommand(commandApplyOffset, applyUniformOffset)
+	uniformOffsetBtn := widget.NewButton("统一偏色", applyUniformOffset)
+	clearOffset := func() {
+		uniformOffsetEntry.SetText("000000")
+		defaultColorPointOffset = "000000"
+		for i := range colorPoints {
+			colorPoints[i].Offset = defaultColorPointOffset
+		}
+		updateTableSelection()
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+	registerCommand(commandClearOffset, clearOffset)
+	clearOffsetBtn := widget.NewButton("清除偏色", clearOffset)
+	refreshShortcutButtonTexts = func() {
+		screenshotBtn.button.SetText(buttonTextWithShortcut("截图", shortcutActionScreenshot))
+		importBtn.SetText(buttonTextWithShortcut("加载", shortcutActionImport))
+		updateRangeButton()
+		autoPickBtn.SetText(buttonTextWithShortcut("自动取色", shortcutActionAutoPick))
+		clearAllBtn.SetText("清空")
+		copyCoordsBtn.SetText("复制坐标")
+		pasteCoordsBtn.SetText("粘贴坐标")
+		uniformOffsetBtn.SetText("统一偏色")
+		clearOffsetBtn.SetText("清除偏色")
+	}
+
+	precisionEntry := makeEntry(userConfig.Precision)
+	precisionEntry.OnChanged = func(string) {
+		refreshImagesAPIFields()
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	}
+	functionSelect := widget.NewSelect([]string{"FindMultiColors", "FindColor", "FindMultiColorsAll", "CmpColor"}, func(string) {
+		if updateImagesAPIFields != nil {
+			updateImagesAPIFields()
+		}
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	})
+	functionSelect.SetSelected(normalizeImagesFunctionName(userConfig.FunctionMode))
+	directionSelect := widget.NewSelect([]string{
+		"0: 从左到右，从上到下",
+		"1: 从右到左，从上到下",
+		"2: 从左到右，从下到上",
+		"3: 从右到左，从下到上",
+	}, func(string) {
+		if updateImagesAPIFields != nil {
+			updateImagesAPIFields()
+		}
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+	})
+	if directionValue(userConfig.DirectionMode) == 1 {
+		directionSelect.SetSelected("1: 从右到左，从上到下")
+	} else if directionValue(userConfig.DirectionMode) == 2 {
+		directionSelect.SetSelected("2: 从左到右，从下到上")
+	} else if directionValue(userConfig.DirectionMode) == 3 {
+		directionSelect.SetSelected("3: 从右到左，从下到上")
+	} else {
+		directionSelect.SetSelected("0: 从左到右，从上到下")
+	}
+	colorEntry := makeEntry("")
+	resultEntry := widget.NewMultiLineEntry()
+	resultEntry.SetPlaceHolder("找色测试结果将显示在这里...")
+	resultEntry.SetMinRowsVisible(5)
+	var refreshOCRColorEntry func()
+	updateImagesAPIFields = func() string {
+		colorText, _, code := buildImagesAPICode(functionSelect.Selected, precisionEntry.Text, directionSelect.Selected)
+		colorEntry.SetText(colorText)
+		if strings.TrimSpace(resultEntry.Text) != "" {
+			resultEntry.SetText("")
+		}
+		if imageViewer != nil {
+			imageViewer.ClearFindTestHighlights()
+		}
+		if refreshOCRColorEntry != nil {
+			refreshOCRColorEntry()
+		}
+		return code
+	}
+	runFindTest := func() {
+		if updateImagesAPIFields != nil {
+			updateImagesAPIFields()
+		}
+
+		var img image.Image
+		if imageViewer != nil {
+			img = imageViewer.image
+		}
+		result, highlights := runImageFindTestResultAndHighlights(img, functionSelect.Selected, precisionEntry.Text, directionSelect.Selected)
+		resultEntry.SetText(result)
+		if imageViewer != nil {
+			imageViewer.SetFindTestHighlights(highlights)
+		}
+	}
+	registerCommand(commandFindTest, runFindTest)
+	findTestBtn := widget.NewButton("找色测试", runFindTest)
+	openCodeTest := func() {
+		showCodeTestDialog(w, functionSelect.Selected, precisionEntry.Text, directionSelect.Selected)
+	}
+	registerCommand(commandCodeTest, openCodeTest)
+	codeTestBtn := widget.NewButton("代码测试", openCodeTest)
+	openImageTest := func() {
+		openOpenCVImageTestWindow(w, precisionEntry.Text)
+	}
+	imageTestBtn := widget.NewButton("找图测试", openImageTest)
+	copyColor := func() {
+		w.Clipboard().SetContent(colorEntry.Text)
+	}
+	registerCommand(commandCopyColor, copyColor)
+	openFormatSettings := func() {
+		generateCodeFunc()
+	}
+	registerCommand(commandFormatSettings, openFormatSettings)
+	copyParams := func() {
+		_, params, _ := buildImagesAPICode(functionSelect.Selected, precisionEntry.Text, directionSelect.Selected)
+		w.Clipboard().SetContent(params)
+	}
+	registerCommand(commandCopyParams, copyParams)
+	openGenerateCode = func() {
+		showImageCodeGenerationDialog(w, functionSelect.Selected, precisionEntry.Text, directionSelect.Selected, saveCurrentConfig)
+	}
+	colorParseBtn := widget.NewButton("颜色解析", func() {
+		showColorImportDialog(w, func(parsed parsedColorImport, points []ColorPoint) {
+			colorPoints = points
+			// Lock the imported/current range while synchronizing point markers.
+			if imageViewer != nil {
+				imageViewer.manualRectSelected = true
+			}
+			if parsed.Rect != nil && rectCoordEntry != nil {
+				r := *parsed.Rect
+				rectCoordEntry.SetText(fmt.Sprintf("%d,%d,%d,%d", r[0], r[1], r[2], r[3]))
+				if imageViewer != nil {
+					imageViewer.markRects = nil
+					if r[2] != 0 && r[3] != 0 {
+						imageViewer.markRects = []MarkRect{{X1: r[0], Y1: r[1], X2: r[2], Y2: r[3], Color: findTestMarkColor}}
+					}
+				}
+			}
+			functionSelect.SetSelected(parsed.Function)
+			if parsed.Similarity != "" {
+				precisionEntry.SetText(parsed.Similarity)
+			}
+			if parsed.Direction != nil {
+				directionSelect.SetSelected(directionSelect.Options[*parsed.Direction])
+			}
+			syncImageViewerMarksFromColorPoints()
+			if tableContent != nil {
+				tableContent.Refresh()
+			}
+			refreshImagesAPIFields()
+			saveCurrentTabData()
+			if saveCurrentConfig != nil {
+				saveCurrentConfig()
+			}
+		})
+	})
+	registerConfiguredShortcuts()
+	saveCurrentConfig = func() {
+		rightPanelSplitOffset := 0.0
+		if centerRightSplit != nil {
+			rightPanelSplitOffset = normalizeSplitOffset(centerRightSplit.Offset)
+		}
+		savedConfig := loadUserConfig()
+		screenshotSource := normalizeScreenshotSource(userConfig.ScreenshotSource)
+		if screenshotSourceSelect != nil {
+			screenshotSource = screenshotSourceFromDisplay(screenshotSourceSelect.Selected)
+		}
+		if screenshotSourceIsRemote() {
+			screenshotSource = screenshotSourceRemote
+		}
+		saveUserConfigSilently(UserConfig{
+			Precision:            strings.TrimSpace(precisionEntry.Text),
+			UniformOffset:        strings.TrimSpace(uniformOffsetEntry.Text),
+			PickCount:            strings.TrimSpace(pickCountEntry.Text),
+			PickMode:             pickModeSelect.Selected,
+			FunctionMode:         functionSelect.Selected,
+			DirectionMode:        directionSelect.Selected,
+			ScreenshotSource:     screenshotSource,
+			RemoteScreenshotPort: remoteScreenshotPort,
+			AutoSaveScreenshot:   autoSaveScreenshot,
+			ScreenshotSavePath:   screenshotSavePath,
+			LogEnabled:           appLoggingEnabled,
+			ThemeMode:            themeModeValue,
+			ThemeScheme:          themeSchemeValue,
+			ShowMagnifier:        showMagnifierCheck.Checked,
+			AutoCopyRange:        autoCopyRangeCheck.Checked,
+			ApplyRange:           applyRangeCheck.Checked,
+			GridMode:             gridModeEnabled,
+			GridCols:             gridColsValue,
+			GridRows:             gridRowsValue,
+			GridSpacing:          gridSpacingValue,
+
+			RightPanelSplitOffset: rightPanelSplitOffset,
+			FontLibWindowWidth:    savedConfig.FontLibWindowWidth,
+			FontLibRightSplit:     savedConfig.FontLibRightSplit,
+			FontLibPaths:          savedConfig.FontLibPaths,
+			CustomThemeSchemes:    copyCustomThemeSchemes(customThemeSchemesValue),
+			FormatTemplates:       copyAPIFormatTemplates(apiFormatTemplates),
+			ImageCodeTemplates:    cloneImageCodeTemplates(imageCodeTemplates),
+			Shortcuts:             copyShortcutConfig(shortcutConfig),
+			ToolButtons:           copyToolButtonConfigs(toolButtonConfig),
+		})
+	}
+
+	compactBottomButton := func(button fyne.CanvasObject) fyne.CanvasObject {
+		return container.New(&compactButtonWidthLayout{reduce: 16}, button)
+	}
+	bottomActionButtons := container.NewGridWithColumns(3,
+		compactBottomButton(generateCodeBtn),
+		compactBottomButton(findTestBtn),
+		compactBottomButton(codeTestBtn),
+	)
+	ocrFunctionSelect := widget.NewSelect([]string{"ocr", "findstr"}, nil)
+	ocrFunctionSelect.SetSelected("ocr")
+	ocrPrecisionEntry := makeEntry("0.90")
+	ocrColorEntry := makeEntry("")
+	ocrSearchEntry := makeEntry("")
+	ocrParamsEntry := makeEntry("")
+	ocrRowsEntry := makeEntry("1")
+	ocrColsEntry := makeEntry("1")
+	ocrResultEntry := widget.NewMultiLineEntry()
+	ocrResultEntry.SetPlaceHolder("识别文字及坐标将显示在这里")
+	ocrResultEntry.SetMinRowsVisible(5)
+	ocrFontPathEntry := makeEntry("")
+	ocrFontPathEntry.Hide()
+	ocrFontHistory := normalizeFontLibPaths(userConfig.FontLibPaths)
+	ocrFontSelect := widget.NewSelect(nil, nil)
+	var loadOCRFont func(string) bool
+	var ocrTestBtn *widget.Button
+	ocrFontSelect.PlaceHolder = "当前没有历史字库"
+	ocrFontSelect.OnChanged = func(label string) {
+		for _, path := range ocrFontHistory {
+			if path == label {
+				loadOCRFont(path)
+				return
+			}
+		}
+	}
+	ocrRemoveFontBtn := widget.NewButtonWithIcon("", theme.CancelIcon(), nil)
+	ocrRemoveFontBtn.Importance = widget.LowImportance
+	ocrRemoveFontBtn.Disable()
+	var refreshOCRPathUI func()
+	refreshOCRPathUI = func() {
+		ocrFontSelect.Options = append([]string(nil), ocrFontHistory...)
+		ocrFontSelect.ClearSelected()
+		if len(ocrFontHistory) == 0 {
+			ocrFontSelect.PlaceHolder = "当前没有历史字库"
+			ocrRemoveFontBtn.Disable()
+		} else {
+			ocrFontSelect.PlaceHolder = "选择字库"
+			ocrRemoveFontBtn.Enable()
+		}
+		ocrFontSelect.Refresh()
+	}
+	var ocrFontChars []FontChar
+	ocrFormatSelect := widget.NewSelect([]string{"纯文本", "JSON"}, nil)
+	ocrFormatSelect.SetSelected("纯文本")
+	ocrCopyParamsBtn := widget.NewButton("复制参数", func() { w.Clipboard().SetContent(ocrParamsEntry.Text) })
+	ocrGenerateBtn := widget.NewButton("生成代码", nil)
+	ocrRemoveFontBtn.OnTapped = func() {
+		selectedPath := ocrFontSelect.Selected
+		if selectedPath == "" {
+			return
+		}
+		ocrFontHistory = removeFontLibPath(ocrFontHistory, selectedPath)
+		saved := loadUserConfig()
+		saved.FontLibPaths = ocrFontHistory
+		saveUserConfigSilently(saved)
+		refreshOCRPathUI()
+		ocrSelectedFontPath = ""
+		ocrFontPathEntry.SetText("")
+		ocrFontChars = nil
+		ocrParamsEntry.SetText("")
+		ocrTestBtn.Disable()
+		ocrGenerateBtn.Disable()
+		fontLibBtn.Disable()
+	}
+	formatOCRColorParam := func() string {
+		points := selectedColorPoints()
+		if len(points) == 0 {
+			return strings.TrimSpace(ocrColorEntry.Text)
+		}
+		return dotOCRColorParam(points)
+	}
+	refreshOCRColorEntry = func() {
+		if len(selectedColorPoints()) == 0 {
+			return
+		}
+		ocrColorEntry.SetText(formatOCRColorParam())
+	}
+	ocrGenerateBtn.OnTapped = func() {
+		precision, err := strconv.ParseFloat(strings.TrimSpace(ocrPrecisionEntry.Text), 64)
+		if err != nil || precision < 0 || precision > 1 {
+			dialog.ShowInformation("提示", "精度请输入 0 到 1 之间的数字", w)
+			return
+		}
+		fontName := strings.TrimSuffix(filepath.Base(strings.TrimSpace(ocrFontPathEntry.Text)), filepath.Ext(ocrFontPathEntry.Text))
+		codeEntry := widget.NewMultiLineEntry()
+		codeEntry.SetMinRowsVisible(8)
+		updateGeneratedCode := func() {
+			code := buildDotOCRCode(ocrFunctionSelect.Selected, ocrSearchEntry.Text, formatOCRColorParam(), strconv.FormatFloat(precision, 'f', 2, 64), fontName, ocrFormatSelect.Selected == "JSON")
+			codeEntry.SetText(code)
+			ocrParamsEntry.SetText(code)
+		}
+		ocrFormatSelect.OnChanged = func(string) { updateGeneratedCode() }
+		updateGeneratedCode()
+		copyButton := widget.NewButton("复制代码", func() { w.Clipboard().SetContent(codeEntry.Text) })
+		formatRow := container.NewBorder(nil, nil, widget.NewLabel("返回格式"), nil, ocrFormatSelect)
+		codeDialog := dialog.NewCustom("生成代码", "关闭", container.NewBorder(container.NewVBox(formatRow, widget.NewSeparator()), copyButton, nil, nil, codeEntry), w)
+		codeDialog.Resize(fyne.NewSize(680, 300))
+		codeDialog.Show()
+	}
+	ocrTestBtn = widget.NewButton("查找测试", func() {
+		if imageViewer == nil || imageViewer.image == nil {
+			dialog.ShowInformation("提示", "请先截图或载入待识别图片", w)
+			return
+		}
+		precision, err := strconv.ParseFloat(strings.TrimSpace(ocrPrecisionEntry.Text), 64)
+		if err != nil || precision < 0 || precision > 1 {
+			dialog.ShowInformation("提示", "精度请输入 0 到 1 之间的数字", w)
+			return
+		}
+		rowGap, rowErr := strconv.Atoi(strings.TrimSpace(ocrRowsEntry.Text))
+		colGap, colErr := strconv.Atoi(strings.TrimSpace(ocrColsEntry.Text))
+		if rowErr != nil || colErr != nil || rowGap < 0 || colGap < 0 {
+			dialog.ShowInformation("提示", "行列分割间距请输入非负整数", w)
+			return
+		}
+		x1, y1, x2, y2 := regionValuesFromEntry()
+		searchImage, regionOrigin, err := cropFontOCRRegion(imageViewer.image, x1, y1, x2, y2)
+		if err != nil {
+			ocrResultEntry.SetText(err.Error())
+			setOpenCVFindTestHighlightRects(imageViewer, nil)
+			return
+		}
+		matches, err := recognizeFontImage(searchImage, ocrFontChars, ocrColorEntry.Text, colGap, rowGap, precision)
+		if err != nil {
+			ocrResultEntry.SetText(err.Error())
+			return
+		}
+		for i := range matches {
+			matches[i].Bounds = matches[i].Bounds.Add(regionOrigin)
+		}
+		if ocrFunctionSelect.Selected == "findstr" {
+			matches = findFontTextMatch(matches, ocrSearchEntry.Text)
+			if len(matches) == 0 {
+				ocrResultEntry.SetText("未找到指定文字")
+				setOpenCVFindTestHighlightRects(imageViewer, nil)
+				return
+			}
+		} else {
+			recognized := matches[:0]
+			for _, match := range matches {
+				if match.Char != "" {
+					recognized = append(recognized, match)
+				}
+			}
+			matches = recognized
+			if len(matches) == 0 {
+				ocrResultEntry.SetText("未匹配到字库字符")
+				setOpenCVFindTestHighlightRects(imageViewer, nil)
+				return
+			}
+		}
+		var rects []MarkRect
+		for _, match := range matches {
+			if match.Char == "" {
+				continue
+			}
+			rects = append(rects, MarkRect{X1: match.Bounds.Min.X, Y1: match.Bounds.Min.Y, X2: match.Bounds.Max.X, Y2: match.Bounds.Max.Y, Color: findTestMarkColor})
+		}
+		ocrResultEntry.SetText(formatFontOCRResult(matches))
+		setOpenCVFindTestHighlightRects(imageViewer, rects)
+	})
+	syncOCRFont = func(path string, chars []FontChar) {
+		if !strings.EqualFold(filepath.Clean(path), filepath.Clean(ocrSelectedFontPath)) {
+			return
+		}
+		ocrFontChars = append([]FontChar(nil), chars...)
+		if len(chars) == 0 {
+			ocrParamsEntry.SetText("字库为空，可制作字库")
+			ocrTestBtn.Disable()
+			ocrGenerateBtn.Disable()
+		} else {
+			ocrParamsEntry.SetText(fmt.Sprintf("FontLib: %d 个字符", len(chars)))
+			ocrTestBtn.Enable()
+			ocrGenerateBtn.Enable()
+		}
+		fontLibBtn.Enable()
+	}
+	loadOCRFont = func(path string) bool {
+		chars, err := readFontLibFile(path)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("读取字库失败: %w", err), w)
+			return false
+		}
+		ocrSelectedFontPath = path
+		ocrFontPathEntry.SetText(path)
+		syncOCRFont(path, chars)
+		return true
+	}
+	ocrLoadFontBtn := widget.NewButton("加载", func() {
+		go func() {
+			path, err := nativedialog.File().Filter("字库文件", "txt", "lib").Title("加载字库").Load()
+			if err != nil {
+				if !errors.Is(err, nativedialog.ErrCancelled) {
+					fyne.Do(func() { dialog.ShowError(err, w) })
+				}
+				return
+			}
+			fyne.Do(func() {
+				ocrFontHistory = addFontLibPath(ocrFontHistory, path)
+				saved := loadUserConfig()
+				saved.FontLibPaths = ocrFontHistory
+				saveUserConfigSilently(saved)
+				refreshOCRPathUI()
+				ocrFontSelect.SetSelected(path)
+			})
+		}()
+	})
+	ocrGenerateBtn.Disable()
+	ocrTestBtn.Disable()
+	fontLibBtn.Disable()
+	ocrSearchEntry.Disable()
+	ocrFunctionSelect.OnChanged = func(value string) {
+		if value == "findstr" {
+			ocrSearchEntry.Enable()
+		} else {
+			ocrSearchEntry.Disable()
+		}
+	}
+	refreshOCRPathUI()
+	refreshOCRColorEntry()
+
+	toolForm := container.NewVBox(
+		container.NewGridWithColumns(4, clearAllBtn, copyCoordsBtn, pasteCoordsBtn, colorParseBtn),
+		container.NewBorder(nil, nil, container.NewHBox(clearOffsetBtn, uniformOffsetBtn), nil, uniformOffsetEntry),
+		container.NewAppTabs(
+			container.NewTabItem("图色面板", container.NewVBox(
+				container.NewBorder(nil, nil, widget.NewLabel("精度"), nil, precisionEntry),
+				container.NewBorder(nil, nil, widget.NewLabel("函数"), nil, functionSelect),
+				container.NewBorder(nil, nil, widget.NewLabel("方向"), nil, directionSelect),
+				container.NewBorder(nil, nil, widget.NewLabel("颜色"), widget.NewButton("复制", copyColor), colorEntry),
+				container.NewBorder(nil, nil, widget.NewLabel("结果"), nil, resultEntry),
+				bottomActionButtons,
+			)),
+			container.NewTabItem("点阵OCR", container.NewVBox(
+				container.NewBorder(nil, nil, widget.NewLabel("字库"), container.NewHBox(ocrRemoveFontBtn, ocrLoadFontBtn), ocrFontSelect),
+				container.NewBorder(nil, nil, widget.NewLabel("函数"), nil, ocrFunctionSelect),
+				container.NewBorder(nil, nil, widget.NewLabel("精度"), nil, ocrPrecisionEntry),
+				container.NewGridWithColumns(2,
+					container.NewBorder(nil, nil, widget.NewLabel("颜色"), nil, ocrColorEntry),
+					container.NewBorder(nil, nil, widget.NewLabel("查找"), nil, ocrSearchEntry),
+				),
+				container.NewBorder(nil, nil, widget.NewLabel("参数"), ocrCopyParamsBtn, ocrParamsEntry),
+				container.NewGridWithColumns(2,
+					container.NewBorder(nil, nil, widget.NewLabel("按行分割"), nil, ocrRowsEntry),
+					container.NewBorder(nil, nil, widget.NewLabel("按列分割"), nil, ocrColsEntry),
+				),
+				container.NewBorder(nil, nil, widget.NewLabel("结果"), nil, ocrResultEntry),
+				container.NewGridWithColumns(3,
+					ocrGenerateBtn,
+					ocrTestBtn,
+					fontLibBtn,
+				),
+			)),
+			container.NewTabItem("找图面板", container.NewVBox(
+				imageTestBtn,
+			)),
+		),
+	)
+
+	// A draggable horizontal splitter lets users choose how much space the
+	// coordinate list and the color-parameter controls receive. Start with
+	// roughly twelve rows visible in the normal window.
+	rightToolSplit := container.NewVSplit(tableBlock, toolForm)
+	defaultTableHeight := colorPointTableHeaderHeight + colorPointTableRowHeight*colorPointTableDefaultVisibleRows
+	if mainWindowSize.Height > 0 {
+		rightToolSplit.Offset = float64(defaultTableHeight / mainWindowSize.Height)
+	}
+	rightToolPanel := rightToolSplit
+	colorToolTabItem := container.NewTabItem("图色工具", rightToolPanel)
+	nodeTabItem = container.NewTabItem("节点工具", nodeTool.Content())
+	appInfoTabItem := container.NewTabItem("App信息", appInfoTool.Content())
+	rightTabs = container.NewAppTabs(
+		colorToolTabItem,
+		nodeTabItem,
+		appInfoTabItem,
+	)
+	selectColorToolTab = func() {
+		if rightTabs != nil && colorToolTabItem != nil {
+			rightTabs.Select(colorToolTabItem)
+		}
+	}
+	selectNodeToolTab = func() {
+		if rightTabs != nil && nodeTabItem != nil {
+			rightTabs.Select(nodeTabItem)
+		}
+	}
+	rightPanel := makeFixedPanel(rightPanelMinWidth, container.NewVScroll(rightTabs))
+
+	// 左工具栏固定宽度；右工具栏默认使用最小宽度，用户可拖拽调整
+	centerRightSplit = container.NewHSplit(tabs, rightPanel)
+	centerRightSplit.Offset = initialRightPanelSplitOffset(userConfig, mainWindowSize.Width, leftPanelWidth, rightPanelMinWidth)
+	w.SetOnClosed(func() {
+		if saveCurrentConfig != nil {
+			saveCurrentConfig()
+		}
+		close(remoteStatusStop)
+		remoteScreenshotActive.Store(false)
+		remoteScreenshotServer.Stop()
+	})
+
+	mainContent := container.NewBorder(nil, nil, leftPanel, nil, centerRightSplit)
+	windowContent := container.NewPadded(mainContent)
+
+	// 设置窗口内容并显示
+	w.SetPadded(false)
+	w.SetContent(windowContent)
+	w.Resize(mainWindowSize)
+	w.CenterOnScreen()
+
+	// 设置拖放图片功能
+	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
+		// 处理拖放的文件
+		for _, uri := range uris {
+			filePath := uri.Path()
+			ext := strings.ToLower(filepath.Ext(filePath))
+
+			// 检查是否为支持的图片格式
+			if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".bmp" {
+				continue
+			}
+
+			// 在 goroutine 中加载图片
+			go func(path string, extension string) {
+				// 读取文件内容
+				data, err := ioutil.ReadFile(path)
+				if err != nil {
+					fyne.Do(func() {
+						dialog.ShowError(fmt.Errorf("读取文件失败: %v", err), w)
+					})
+					return
+				}
+
+				// 根据文件扩展名解码图像
+				var img image.Image
+
+				switch extension {
+				case ".png":
+					img, err = png.Decode(bytes.NewReader(data))
+				case ".jpg", ".jpeg":
+					img, err = jpeg.Decode(bytes.NewReader(data))
+				case ".bmp":
+					img, err = bmp.Decode(bytes.NewReader(data))
+				default:
+					// 尝试自动检测格式
+					img, _, err = image.Decode(bytes.NewReader(data))
+				}
+
+				if err != nil {
+					fyne.Do(func() {
+						dialog.ShowError(fmt.Errorf("解码图像失败: %v", err), w)
+					})
+					return
+				}
+
+				// 转换为NRGBA格式
+				img = convertToNRGBA(img)
+
+				// 在主线程中更新UI
+				fyne.Do(func() {
+					// 保存当前标签页的数据
+					saveCurrentTabData()
+
+					// 创建新的图像查看器和标签页
+					newImageViewer := NewImageViewer()
+					newMagnifier := NewMagnifierWidget()
+
+					newImgContainer := container.New(&topLeftLayout{}, newImageViewer)
+					newScrollContainer := newImageScrollContainer(newImgContainer, newImageViewer)
+
+					newImageViewer.scrollContainer = newScrollContainer
+					newImageViewer.magnifier = newMagnifier
+					configureImageViewer(newImageViewer)
+					newImageViewer.SetImage(img)
+
+					// 创建新标签页
+					newScrollWithMagnifier := container.NewStack(newScrollContainer, newMagnifier)
+					tabCounter++
+
+					// 使用文件名作为标签名称
+					tabName := filepath.Base(path)
+					newTab := container.NewTabItem(tabName, newScrollWithMagnifier)
+
+					// 初始化新标签页的数据
+					tabDataMap[newTab] = &TabData{
+						colorPoints:        make([]ColorPoint, 0),
+						markRects:          make([]MarkRect, 0),
+						manualRectSelected: false,
+						imageViewer:        newImageViewer,
+						generatedCode:      "",
+					}
+
+					tabs.Append(newTab)
+					tabs.Select(newTab)
+
+					// 更新当前标签页引用
+					currentTab = newTab
+
+					// 更新当前imageViewer引用
+					imageViewer = newImageViewer
+					fitImageToView(newImageViewer)
+					w.Canvas().Focus(newImageViewer)
+
+					// 清空颜色点列表和矩形区域
+					colorPoints = make([]ColorPoint, 0)
+					if rectCoordEntry != nil {
+						rectCoordEntry.SetText(defaultRangeText)
+					}
+					if codeDisplayEntry != nil {
+						codeDisplayEntry.SetText("")
+					}
+
+					// 刷新表格
+					if refreshColorList != nil {
+						refreshColorList()
+					}
+				})
+			}(filePath, ext)
+
+			// 只处理第一个有效的图片文件
+			break
+		}
+	})
+
+	// 确保初始显示与当前系统主题匹配
+	updateTableHeader()
+	updateTableSelection()
+
+	w.ShowAndRun()
+}
+
+// 带权重的网格布局，让不同列有不同的宽度
+type weightedGridLayout struct {
+	cols    int
+	weights []float32 // 每列的权重
+}
+
+func (g *weightedGridLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	w, h := float32(0), float32(0)
+	for i, obj := range objects {
+		if i >= g.cols {
+			break
+		}
+		childSize := obj.MinSize()
+		w += childSize.Width * g.weights[i]
+		h = fyne.Max(h, childSize.Height)
+	}
+	return fyne.NewSize(w, h)
+}
+
+func (g *weightedGridLayout) Layout(objects []fyne.CanvasObject, containerSize fyne.Size) {
+	// 计算总权重
+	totalWeight := float32(0)
+	for _, weight := range g.weights {
+		totalWeight += weight
+	}
+
+	// 计算单位宽度
+	unitWidth := containerSize.Width / totalWeight
+
+	// 布局对象
+	x := float32(0)
+	for i, obj := range objects {
+		if i >= g.cols {
+			break
+		}
+
+		// 计算此列宽度
+		colWidth := unitWidth * g.weights[i]
+
+		// 设置对象大小和位置
+		obj.Move(fyne.NewPos(x, 0))
+		obj.Resize(fyne.NewSize(colWidth, containerSize.Height))
+
+		// 更新x坐标
+		x += colWidth
+	}
+}
+
+// 自定义布局，确保图像坐标和滚动偏移都以左上角为基准
+type topLeftLayout struct{}
+
+func (t *topLeftLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	minSize := fyne.NewSize(0, 0)
+	for _, obj := range objects {
+		objSize := obj.MinSize()
+		minSize.Width = fyne.Max(minSize.Width, objSize.Width)
+		minSize.Height = fyne.Max(minSize.Height, objSize.Height)
+	}
+	return minSize
+}
+
+func (t *topLeftLayout) Layout(objects []fyne.CanvasObject, containerSize fyne.Size) {
+	for _, obj := range objects {
+		size := obj.MinSize()
+		obj.Resize(size)
+		obj.Move(fyne.NewPos(0, 0))
+	}
+}
+
+type compactPaddedLayout struct {
+	padding float32
+}
+
+func (p *compactPaddedLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(p.padding*2, p.padding*2)
+	}
+
+	size := objects[0].MinSize()
+	return size.Add(fyne.NewSize(p.padding*2, p.padding*2))
+}
+
+func (p *compactPaddedLayout) Layout(objects []fyne.CanvasObject, containerSize fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+
+	innerSize := fyne.NewSize(
+		fyne.Max(0, containerSize.Width-p.padding*2),
+		fyne.Max(0, containerSize.Height-p.padding*2),
+	)
+	objects[0].Move(fyne.NewPos(p.padding, p.padding))
+	objects[0].Resize(innerSize)
+}
+
+type fixedContentWidthLayout struct {
+	width float32
+}
+
+func (l *fixedContentWidthLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	height := float32(1)
+	if len(objects) > 0 {
+		height = objects[0].MinSize().Height
+	}
+	return fyne.NewSize(l.width, height)
+}
+
+func (l *fixedContentWidthLayout) Layout(objects []fyne.CanvasObject, containerSize fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	objects[0].Move(fyne.NewPos(0, 0))
+	objects[0].Resize(fyne.NewSize(l.width, containerSize.Height))
+}
+
+type compactButtonWidthLayout struct {
+	reduce float32
+}
+
+func (l *compactButtonWidthLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	size := objects[0].MinSize()
+	size.Width = fyne.Max(1, size.Width-l.reduce)
+	return size
+}
+
+func (l *compactButtonWidthLayout) Layout(objects []fyne.CanvasObject, containerSize fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	objects[0].Move(fyne.NewPos(0, 0))
+	objects[0].Resize(containerSize)
+}
+
+// 固定宽度布局
+type fixedWidthLayout struct {
+	width           float32
+	padding         float32 // 水平内边距
+	verticalSpacing float32 // 垂直间距
+}
+
+func (f *fixedWidthLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	height := float32(0)
+	for i, o := range objects {
+		childSize := o.MinSize()
+		height += childSize.Height
+
+		// 除了最后一个元素，其他元素后面都加上间距
+		if i < len(objects)-1 {
+			height += f.verticalSpacing
+		}
+	}
+	return fyne.NewSize(f.width, height)
+}
+
+func (f *fixedWidthLayout) Layout(objects []fyne.CanvasObject, containerSize fyne.Size) {
+	pos := fyne.NewPos(0, 0)
+	for i, o := range objects {
+		var size fyne.Size
+		minSize := o.MinSize()
+
+		if _, isBorder := o.(*fyne.Container); isBorder {
+			// 如果是BorderLayout容器，让它占据整个高度
+			size = fyne.NewSize(f.width, containerSize.Height)
+		} else {
+			// 所有控件宽度相同，但会应用内边距
+			size = fyne.NewSize(f.width-(f.padding*2), minSize.Height)
+		}
+
+		// 对大多数控件应用水平内边距
+		objPos := fyne.NewPos(pos.X+f.padding, pos.Y)
+
+		// 布局和尺寸调整
+		o.Move(objPos)
+		o.Resize(size)
+
+		// 更新下一个元素的位置，添加垂直间距
+		pos = pos.Add(fyne.NewPos(0, minSize.Height))
+		if i < len(objects)-1 {
+			pos = pos.Add(fyne.NewPos(0, f.verticalSpacing))
+		}
+	}
+}
