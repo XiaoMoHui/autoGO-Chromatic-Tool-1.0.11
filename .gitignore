@@ -12,3 +12,8 @@ docs/*.md
 docs/**/*.md
 
 .serena/
+
+# Local Go build caches
+/.go-build-cache/
+/.gocache/
+/.gocache-local/

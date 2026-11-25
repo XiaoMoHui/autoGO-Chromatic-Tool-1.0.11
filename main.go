@@ -75,7 +75,6 @@ type UserConfig struct {
 	GridSpacing          int    `json:"grid_spacing"`
 
 	RightPanelSplitOffset float64                   `json:"right_panel_split_offset"`
-	FontLibWindowWidth    float32                   `json:"font_lib_window_width"`
 	FontLibRightSplit     float64                   `json:"font_lib_right_split"`
 	FontLibPaths          []string                  `json:"font_lib_paths"`
 	CustomThemeSchemes    []CustomThemeSchemeConfig `json:"custom_theme_schemes"`
@@ -1294,37 +1293,17 @@ func removeFontLibPath(paths []string, path string) []string {
 	return result
 }
 
-func normalizeFontLibWindowWidth(width float32) float32 {
-	if math.IsNaN(float64(width)) || width < 600 || width > 4000 {
-		return 0
-	}
-	return width
-}
-
 func initialFontLibWindowSize(config UserConfig) fyne.Size {
-	return fontLibWindowSizeForScreen(config.FontLibWindowWidth, initialWindowSize(1, 1))
+	return fontLibWindowSizeForScreen(initialWindowSize(1, 1))
 }
 
-func fontLibWindowSizeForScreen(savedWidth float32, screen fyne.Size) fyne.Size {
-	const aspectRatio = float32(1.28)
+func fontLibWindowSizeForScreen(screen fyne.Size) fyne.Size {
 	if screen.Width <= 0 || screen.Height <= 0 {
 		screen = fyne.NewSize(1000, 650)
 	}
-	maxWidth := screen.Width * 0.9
-	maxHeight := screen.Height * 0.9
-	width := float32(math.Sqrt(0.5 * float64(aspectRatio*screen.Width*screen.Height)))
-	if width > maxWidth {
-		width = maxWidth
-	}
-	if heightLimitedWidth := maxHeight * aspectRatio; width > heightLimitedWidth {
-		width = heightLimitedWidth
-	}
-	if saved := normalizeFontLibWindowWidth(savedWidth); saved > 0 {
-		if saved < width {
-			width = saved
-		}
-	}
-	return fyne.NewSize(width, width/aspectRatio)
+	width := screen.Width * 0.80
+	height := screen.Height * 0.85
+	return fyne.NewSize(width, height)
 }
 
 func initialFontLibRightSplitOffset(config UserConfig) float64 {
@@ -1583,7 +1562,6 @@ func normalizeUserConfig(config UserConfig) UserConfig {
 		config.GridSpacing = defaults.GridSpacing
 	}
 	config.RightPanelSplitOffset = normalizeSplitOffset(config.RightPanelSplitOffset)
-	config.FontLibWindowWidth = normalizeFontLibWindowWidth(config.FontLibWindowWidth)
 	config.FontLibRightSplit = normalizeSplitOffset(config.FontLibRightSplit)
 	config.FontLibPaths = normalizeFontLibPaths(config.FontLibPaths)
 	config.FormatTemplates = normalizeAPIFormatTemplates(config.FormatTemplates)
@@ -7081,7 +7059,7 @@ func main() {
 	var applyScreenshotSource func(string, bool)
 	var refreshRemoteStatus func()
 	remoteStatusStop := make(chan struct{})
-	mainWindowSize := initialWindowSize(0.70, 0.70)
+	mainWindowSize := initialWindowSize(0.85, 0.90)
 	apiFormatTemplates = copyAPIFormatTemplates(userConfig.FormatTemplates)
 	imageCodeTemplates = cloneImageCodeTemplates(userConfig.ImageCodeTemplates)
 	magnifierEnabled = userConfig.ShowMagnifier
@@ -7408,6 +7386,19 @@ func main() {
 
 	// 创建左侧工具栏按钮 - 使用带动画的截图按钮
 	var screenshotBtn *AnimatedScreenshotButton
+	// Resolve the screenshot source on the UI thread before capturing in the background.
+	selectedScreenshotCapture := func() func() (image.Image, error) {
+		if screenshotSourceIsRemote() {
+			return remoteScreenshotServer.RequestScreenshot
+		}
+		deviceID := selectedAndroidDeviceID()
+		return func() (image.Image, error) {
+			if deviceID == "" {
+				return nil, fmt.Errorf("请先选择本地 ADB 设备")
+			}
+			return captureScreenWithADB(deviceID)
+		}
+	}
 	captureScreenshot := func() {
 		if screenshotBtn == nil || screenshotBtn.IsLoading() {
 			return
@@ -7417,21 +7408,11 @@ func main() {
 		screenshotBtn.StartLoading()
 		shouldAutoSave := autoSaveScreenshot
 		autoSavePath := screenshotSavePath
+		capture := selectedScreenshotCapture()
 
 		// 异步执行截图操作
 		go func() {
-			var capturedImg image.Image
-			var err error
-			if screenshotSourceIsRemote() {
-				capturedImg, err = remoteScreenshotServer.RequestScreenshot()
-			} else {
-				deviceID := selectedAndroidDeviceID()
-				if deviceID == "" {
-					err = fmt.Errorf("请先选择本地 ADB 设备")
-				} else {
-					capturedImg, err = captureScreenWithADB(deviceID)
-				}
-			}
+			capturedImg, err := capture()
 			if err == nil && shouldAutoSave {
 				if savedPath, saveErr := saveScreenshotToDirectory(capturedImg, autoSavePath); saveErr != nil {
 					log.Printf("截图自动保存失败: %v", saveErr)
@@ -7856,7 +7837,7 @@ func main() {
 			dialog.ShowInformation("提示", "请先选择字库 TXT 文件，空文件也可以用于制作字库", w)
 			return
 		}
-		openFontLibWindow(w, path, func(chars []FontChar) {
+		openFontLibWindow(w, path, selectedScreenshotCapture, func(chars []FontChar) {
 			if syncOCRFont != nil {
 				syncOCRFont(path, chars)
 			}
@@ -9384,7 +9365,6 @@ func main() {
 			GridSpacing:          gridSpacingValue,
 
 			RightPanelSplitOffset: rightPanelSplitOffset,
-			FontLibWindowWidth:    savedConfig.FontLibWindowWidth,
 			FontLibRightSplit:     savedConfig.FontLibRightSplit,
 			FontLibPaths:          savedConfig.FontLibPaths,
 			CustomThemeSchemes:    copyCustomThemeSchemes(customThemeSchemesValue),
@@ -9409,6 +9389,27 @@ func main() {
 	ocrColorEntry := makeEntry("")
 	ocrSearchEntry := makeEntry("")
 	ocrParamsEntry := makeEntry("")
+	var ocrCharOptions []string
+	ocrCharPicker := newOCRCharPicker(w, func() []string { return ocrCharOptions }, func(char string) {
+		ocrFunctionSelect.SetSelected("findstr")
+		ocrSearchEntry.SetText(char)
+	})
+	refreshOCRCharOptions := func(chars []FontChar) {
+		options := make([]string, 0, len(chars))
+		for _, char := range chars {
+			if strings.TrimSpace(char.Char) == "" {
+				continue
+			}
+			options = append(options, char.Char)
+		}
+		ocrCharOptions = options
+		if len(options) == 0 {
+			ocrCharPicker.Disable()
+		} else {
+			ocrCharPicker.Enable()
+		}
+	}
+	refreshOCRCharOptions(nil)
 	ocrRowsEntry := makeEntry("1")
 	ocrColsEntry := makeEntry("1")
 	ocrResultEntry := widget.NewMultiLineEntry()
@@ -9463,6 +9464,7 @@ func main() {
 		ocrSelectedFontPath = ""
 		ocrFontPathEntry.SetText("")
 		ocrFontChars = nil
+		refreshOCRCharOptions(nil)
 		ocrParamsEntry.SetText("")
 		ocrTestBtn.Disable()
 		ocrGenerateBtn.Disable()
@@ -9570,6 +9572,7 @@ func main() {
 			return
 		}
 		ocrFontChars = append([]FontChar(nil), chars...)
+		refreshOCRCharOptions(chars)
 		if len(chars) == 0 {
 			ocrParamsEntry.SetText("字库为空，可制作字库")
 			ocrTestBtn.Disable()
@@ -9645,7 +9648,7 @@ func main() {
 					container.NewBorder(nil, nil, widget.NewLabel("颜色"), nil, ocrColorEntry),
 					container.NewBorder(nil, nil, widget.NewLabel("查找"), nil, ocrSearchEntry),
 				),
-				container.NewBorder(nil, nil, widget.NewLabel("参数"), ocrCopyParamsBtn, ocrParamsEntry),
+				container.NewBorder(nil, nil, widget.NewLabel("参数"), container.NewHBox(ocrCharPicker, ocrCopyParamsBtn), ocrParamsEntry),
 				container.NewGridWithColumns(2,
 					container.NewBorder(nil, nil, widget.NewLabel("按行分割"), nil, ocrRowsEntry),
 					container.NewBorder(nil, nil, widget.NewLabel("按列分割"), nil, ocrColsEntry),

@@ -10,7 +10,50 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/test"
 )
+
+func TestFontSplitPreviewKeepsOutlineAtReducedZoom(t *testing.T) {
+	a := test.NewApp()
+	defer a.Quit()
+
+	binary := image.NewNRGBA(image.Rect(0, 0, 5, 5))
+	foreground := color.NRGBA{G: 255, A: 255}
+	fillFontTestRect(binary, image.Rect(0, 0, 3, 3), foreground)
+	binary.SetNRGBA(4, 4, foreground)
+
+	dots, cells := renderDotMatrix(binary, 0, 0)
+	if len(cells) != 2 {
+		t.Fatalf("got %d split cells, want the glyph and the single pixel", len(cells))
+	}
+	viewer := newFontImageViewer()
+	viewer.SetImage(dots)
+	viewer.splitCells = cells
+	viewer.SetZoom(fontPreviewZoomForSourceZoom(1))
+
+	window := a.NewWindow("")
+	defer window.Close()
+	window.SetPadded(false)
+	window.SetContent(viewer)
+	window.Resize(viewer.MinSize())
+	preview := window.Canvas().Capture()
+	red := func(x, y int) bool {
+		r, g, _, _ := preview.At(x, y).RGBA()
+		return r > 0xc000 && g < 0x6000
+	}
+	for _, p := range []image.Point{{1, 0}, {0, 1}, {1, 3}, {3, 1}} {
+		if !red(p.X, p.Y) {
+			t.Errorf("missing red segment outline at %v", p)
+		}
+	}
+	for y := 4; y < preview.Bounds().Max.Y; y++ {
+		for x := 4; x < preview.Bounds().Max.X; x++ {
+			if red(x, y) {
+				t.Errorf("single foreground pixel has a red outline at (%d,%d)", x, y)
+			}
+		}
+	}
+}
 
 func newSolidFontTestImage(w, h int, c color.NRGBA) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))

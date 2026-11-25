@@ -1489,43 +1489,41 @@ func renderFontBinary(binaryImg *image.NRGBA, bboxes []image.Rectangle) (*image.
 		}
 	}
 
-	rectColor := color.NRGBA{255, 50, 0, 255}
 	var cells []CharCell
 	for _, bbox := range bboxes {
-		dx1 := bbox.Min.X * stride
-		dy1 := bbox.Min.Y * stride
-		dx2 := bbox.Max.X * stride
-		dy2 := bbox.Max.Y * stride
-		drawRectOutlineOnImg(display, dx1, dy1, dx2, dy2, rectColor, 2)
 		cells = append(cells, CharCell{BBox: bbox, Bitmap: extractBitmapFromRect(binaryImg, bbox)})
 	}
 	return display, cells
 }
 
-func drawRectOutlineOnImg(img *image.NRGBA, x1, y1, x2, y2 int, c color.NRGBA, thickness int) {
-	bx, by := img.Bounds().Dx(), img.Bounds().Dy()
-	for t := 0; t < thickness; t++ {
-		for x := x1; x <= x2; x++ {
-			if x >= 0 && x < bx {
-				if y1+t >= 0 && y1+t < by {
-					img.SetNRGBA(x, y1+t, c)
-				}
-				if y2-t >= 0 && y2-t < by {
-					img.SetNRGBA(x, y2-t, c)
-				}
-			}
+func renderFontSplitOutlines(cells []CharCell, dots image.Rectangle, width, height int) image.Image {
+	overlay := image.NewNRGBA(image.Rect(0, 0, width, height))
+	red := color.NRGBA{255, 50, 0, 255}
+	const stride = dotCellSize + 1
+	for _, cell := range cells {
+		bbox := cell.BBox
+		if bbox.Dx() == 1 && bbox.Dy() == 1 {
+			continue
 		}
-		for y := y1; y <= y2; y++ {
-			if y >= 0 && y < by {
-				if x1+t >= 0 && x1+t < bx {
-					img.SetNRGBA(x1+t, y, c)
-				}
-				if x2-t >= 0 && x2-t < bx {
-					img.SetNRGBA(x2-t, y, c)
-				}
-			}
+		rect := image.Rect(
+			bbox.Min.X*stride*width/dots.Dx(),
+			bbox.Min.Y*stride*height/dots.Dy(),
+			(bbox.Max.X*stride*width+dots.Dx()-1)/dots.Dx(),
+			(bbox.Max.Y*stride*height+dots.Dy()-1)/dots.Dy(),
+		).Intersect(overlay.Bounds())
+		if rect.Empty() {
+			continue
+		}
+		for x := rect.Min.X; x < rect.Max.X; x++ {
+			overlay.SetNRGBA(x, rect.Min.Y, red)
+			overlay.SetNRGBA(x, rect.Max.Y-1, red)
+		}
+		for y := rect.Min.Y; y < rect.Max.Y; y++ {
+			overlay.SetNRGBA(rect.Min.X, y, red)
+			overlay.SetNRGBA(rect.Max.X-1, y, red)
 		}
 	}
+	return overlay
 }
 
 func createCharPreview(bitmap [][]bool, cellSize int) image.Image {
@@ -1811,6 +1809,7 @@ const (
 type fontImageViewer struct {
 	widget.BaseWidget
 	image              image.Image
+	splitCells         []CharCell
 	zoom               float32
 	scroll             *container.Scroll
 	selection          image.Rectangle
@@ -1886,6 +1885,7 @@ func (v *fontImageViewer) SetImage(img image.Image) {
 		img = openCVImageToNRGBA(img)
 	}
 	v.image = img
+	v.splitCells = nil
 	v.zoom = 1
 	v.selection = image.Rectangle{}
 	v.tempSelection = image.Rectangle{}
@@ -2135,6 +2135,13 @@ func (v *fontImageViewer) CreateRenderer() fyne.WidgetRenderer {
 	img := canvas.NewImageFromImage(v.image)
 	img.FillMode = canvas.ImageFillStretch
 	img.ScaleMode = canvas.ImageScalePixels
+	outlines := canvas.NewRaster(func(w, h int) image.Image {
+		if v.image == nil || len(v.splitCells) == 0 {
+			return image.NewNRGBA(image.Rect(0, 0, 1, 1))
+		}
+		return renderFontSplitOutlines(v.splitCells, v.image.Bounds(), w, h)
+	})
+	outlines.Hide()
 	selection := canvas.NewRectangle(color.Transparent)
 	selection.StrokeColor = color.NRGBA{255, 170, 0, 255}
 	selection.StrokeWidth = 2
@@ -2142,8 +2149,9 @@ func (v *fontImageViewer) CreateRenderer() fyne.WidgetRenderer {
 	return &fontImageViewerRenderer{
 		viewer:    v,
 		image:     img,
+		outlines:  outlines,
 		selection: selection,
-		objects:   []fyne.CanvasObject{img, selection},
+		objects:   []fyne.CanvasObject{img, outlines, selection},
 	}
 }
 
@@ -2315,6 +2323,7 @@ func (fontScrollOverlayRenderer) Destroy()                     {}
 type fontImageViewerRenderer struct {
 	viewer    *fontImageViewer
 	image     *canvas.Image
+	outlines  *canvas.Raster
 	selection *canvas.Rectangle
 	objects   []fyne.CanvasObject
 }
@@ -2322,6 +2331,7 @@ type fontImageViewerRenderer struct {
 func (r *fontImageViewerRenderer) Layout(size fyne.Size) {
 	r.image.Move(fyne.NewPos(0, 0))
 	r.image.Resize(r.viewer.minSize())
+	r.outlines.Resize(r.image.Size())
 	r.updateSelection()
 }
 
@@ -2331,14 +2341,18 @@ func (r *fontImageViewerRenderer) MinSize() fyne.Size {
 
 func (r *fontImageViewerRenderer) Refresh() {
 	r.image.Image = r.viewer.image
-	r.image.Move(fyne.NewPos(0, 0))
-	r.image.Resize(r.viewer.minSize())
+	r.Layout(r.viewer.Size())
 	if r.viewer.image == nil {
 		r.image.Hide()
 	} else {
 		r.image.Show()
 	}
-	r.updateSelection()
+	if r.viewer.image != nil && len(r.viewer.splitCells) > 0 {
+		r.outlines.Show()
+		r.outlines.Refresh()
+	} else {
+		r.outlines.Hide()
+	}
 	canvas.Refresh(r.image)
 	canvas.Refresh(r.selection)
 }
@@ -2378,10 +2392,54 @@ func (r *fontImageViewerRenderer) updateSelection() {
 
 const fontLibWindowTitle = "AutoGo 字库制作"
 
+func newOCRCharPicker(window fyne.Window, options func() []string, onSelected func(string)) *widget.Button {
+	button := widget.NewButtonWithIcon("选字", theme.MenuDropDownIcon(), nil)
+	button.IconPlacement = widget.ButtonIconTrailingText
+	button.OnTapped = func() {
+		chars := options()
+		if len(chars) == 0 {
+			return
+		}
+		newLabel := func() *widget.Label {
+			label := widget.NewLabel("")
+			label.Truncation = fyne.TextTruncateEllipsis
+			return label
+		}
+		list := widget.NewList(
+			func() int { return len(chars) },
+			func() fyne.CanvasObject { return newLabel() },
+			func(id widget.ListItemID, row fyne.CanvasObject) { row.(*widget.Label).SetText(chars[id]) },
+		)
+		windowCanvas := window.Canvas()
+		popup := widget.NewPopUp(list, windowCanvas)
+		list.OnSelected = func(id widget.ListItemID) {
+			popup.Hide()
+			onSelected(chars[id])
+		}
+		const visibleRows = 8
+		rows := float32(min(visibleRows, len(chars)))
+		height := rows*newLabel().MinSize().Height + (rows-1)*theme.Padding() + theme.Size(theme.SizeNameInnerPadding)
+		area := windowCanvas.Size()
+		width := fyne.Max(button.Size().Width, 140)
+		size := fyne.NewSize(fyne.Min(width, area.Width), fyne.Min(height, area.Height))
+		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(button)
+		y := pos.Y + button.Size().Height
+		if y+size.Height > area.Height && pos.Y >= size.Height {
+			y = pos.Y - size.Height
+		}
+		popup.Resize(size)
+		x := fyne.Max(0, fyne.Min(pos.X, area.Width-size.Width))
+		y = fyne.Max(0, fyne.Min(y, area.Height-size.Height))
+		popup.ShowAtPosition(fyne.NewPos(x, y))
+	}
+	return button
+}
+
 var fontLibWindow fyne.Window
 var fontLibCurrentPath string
+var lastFontLibCrop image.Rectangle
 
-func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]FontChar)) {
+func openFontLibWindow(parentWindow fyne.Window, path string, selectedScreenshotCapture func() func() (image.Image, error), onChanged func([]FontChar)) {
 	path = strings.TrimSpace(path)
 	chars, err := readFontLibFile(path)
 	if err != nil {
@@ -2617,6 +2675,7 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 		dotImg, _ := renderFontBinary(binaryRegion, nil)
 		charCells = nil
 		previewViewer.image = dotImg
+		previewViewer.splitCells = nil
 		previewViewer.Refresh()
 		previewScroll.Refresh()
 	}
@@ -2892,6 +2951,8 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 			deleteButton := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
 				if idx >= 0 && idx < len(charCells) {
 					charCells = append(charCells[:idx], charCells[idx+1:]...)
+					previewViewer.splitCells = charCells
+					previewViewer.Refresh()
 					rebuildSplitList()
 				}
 			})
@@ -2992,6 +3053,7 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 		dotImg, cells := renderDotMatrix(binaryRegion, cg, rg)
 		charCells = cells
 		previewViewer.image = dotImg
+		previewViewer.splitCells = cells
 		previewViewer.Refresh()
 		rebuildSplitList()
 		previewInfoLabel.SetText(fmt.Sprintf("分割完成: %d 个字符 | 列间距:%d 行间距:%d | 修改二值图后请重新分割", len(cells), cg, rg))
@@ -3104,6 +3166,10 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 	})
 	matchLibBtn.Importance = widget.HighImportance
 
+	recaptureBtn := widget.NewButtonWithIcon("原位置截图", theme.ViewRefreshIcon(), nil)
+	if lastFontLibCrop.Empty() {
+		recaptureBtn.Disable()
+	}
 	getSelBtn := widget.NewButtonWithIcon("去裁剪选取", theme.VisibilityIcon(), func() {
 		if imageViewer == nil || imageViewer.image == nil {
 			dialog.ShowInformation("提示", "主窗口没有图片，请先截图或载入", w)
@@ -3112,6 +3178,9 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 		viewer := imageViewer
 		sourceInfoLabel.SetText("请在主窗口图像上拖拽框选文字区域，松开后会自动回填到字库制作")
 		viewer.SetRangeSelectModeWithCallback(func(rect image.Rectangle) {
+			if fontLibWindow != w {
+				return
+			}
 			if imageViewer != viewer || viewer.image == nil {
 				w.Show()
 				w.RequestFocus()
@@ -3126,6 +3195,8 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 				return
 			}
 			setRegionImage(cropImage(viewer.image, selRect))
+			lastFontLibCrop = selRect
+			recaptureBtn.Enable()
 			w.Show()
 			w.RequestFocus()
 		})
@@ -3133,6 +3204,40 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 		parentWindow.RequestFocus()
 	})
 	getSelBtn.Importance = widget.HighImportance
+	recaptureBtn.OnTapped = func() {
+		rect := lastFontLibCrop
+		if rect.Empty() {
+			return
+		}
+		capture := selectedScreenshotCapture()
+		recaptureBtn.Disable()
+		recaptureBtn.SetText("截图中…")
+		getSelBtn.Disable()
+		go func() {
+			img, err := capture()
+			var cropped image.Image
+			if err == nil {
+				if img == nil || !rect.In(img.Bounds()) {
+					err = fmt.Errorf("上次选区超出新截图范围，请重新裁剪选取")
+				} else {
+					cropped = cropImage(img, rect)
+				}
+			}
+			fyne.Do(func() {
+				if fontLibWindow != w {
+					return
+				}
+				recaptureBtn.SetText("原位置截图")
+				recaptureBtn.Enable()
+				getSelBtn.Enable()
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("原位置截图失败: %w", err), w)
+					return
+				}
+				setRegionImage(cropped)
+			})
+		}()
+	}
 
 	loadImageBtn := widget.NewButtonWithIcon("加载图片", theme.FolderOpenIcon(), func() {
 		go func() {
@@ -3275,33 +3380,6 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 		refreshPreview()
 	})
 
-	copyBtn := widget.NewButtonWithIcon("复制", theme.ContentCopyIcon(), func() {
-		if len(fontLibChars) == 0 {
-			dialog.ShowInformation("提示", "字库为空", w)
-			return
-		}
-		var sb strings.Builder
-		for _, ch := range fontLibChars {
-			sb.WriteString(fmt.Sprintf("%s$%s$1$0.0.%d$%d\n", ch.Char, ch.HexData, ch.WhitePixels, ch.Width))
-		}
-		w.Clipboard().SetContent(sb.String())
-		dialog.ShowInformation("成功", fmt.Sprintf("已复制 %d 个字符到剪贴板", len(fontLibChars)), w)
-	})
-
-	clearLibBtn := widget.NewButtonWithIcon("清空", theme.DeleteIcon(), func() {
-		if len(fontLibChars) == 0 {
-			return
-		}
-		dialog.ShowConfirm("确认", fmt.Sprintf("确定清空字库中的 %d 个字符？", len(fontLibChars)), func(ok bool) {
-			if ok {
-				fontLibChars = nil
-				syncFontLibToFile()
-				rebuildLibList()
-				refreshPreview()
-			}
-		}, w)
-	})
-
 	syncColorsBtn := widget.NewButton("同步图色", func() {
 		toolColorsCleared = false
 		autoForegroundSamples = nil
@@ -3350,6 +3428,7 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 
 	leftPanel := container.NewVScroll(container.New(&fixedWidthLayout{width: 210, padding: 8, verticalSpacing: 4},
 		getSelBtn,
+		recaptureBtn,
 		loadImageBtn,
 		widget.NewSeparator(),
 		colorSourceRow,
@@ -3381,10 +3460,10 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 	centerSplit := container.NewVSplit(sourcePanel, previewPanel)
 	centerSplit.Offset = 0.65
 
-	quickFillRow := container.NewBorder(nil, nil, nil, quickFillBtn, quickFillEntry)
+	quickFillRow := container.NewVBox(quickFillEntry, quickFillBtn)
 	similarityRow := container.NewBorder(nil, nil, widget.NewLabel("最低相似度:"), nil, similarityEntry)
-	matchRow := container.NewBorder(nil, nil, nil, matchLibBtn, similarityRow)
-	addSelectedRow := container.NewBorder(nil, nil, toggleSelectBtn, nil, addToLibBtn)
+	matchRow := container.NewVBox(similarityRow, matchLibBtn)
+	addSelectedRow := container.NewVBox(toggleSelectBtn, addToLibBtn)
 	splitPanel := container.NewBorder(
 		container.NewVBox(widget.NewLabelWithStyle("分割结果", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), widget.NewSeparator()),
 		container.NewVBox(widget.NewSeparator(), matchRow, quickFillRow, addSelectedRow),
@@ -3392,30 +3471,21 @@ func openFontLibWindow(parentWindow fyne.Window, path string, onChanged func([]F
 		container.NewVScroll(splitListBox),
 	)
 
-	libButtons := container.NewVBox(
-		widget.NewSeparator(),
-		container.NewGridWithColumns(2, copyBtn, clearLibBtn),
-	)
 	libPanel := container.NewBorder(
 		container.NewVBox(libHeaderLabel, libFileLabel, libSearchEntry, widget.NewSeparator()),
-		libButtons,
-		nil, nil,
+		nil, nil, nil,
 		container.NewVScroll(fontLibListBox),
 	)
 
-	rightSplit := container.NewVSplit(splitPanel, libPanel)
-	rightSplit.Offset = 0.62
-	rightBg := canvas.NewRectangle(color.Transparent)
-	rightBg.SetMinSize(fyne.NewSize(320, 0))
-	rightPanel := container.NewStack(rightBg, container.NewPadded(rightSplit))
+	// Keep both lists at full height; the divider adjusts their column widths.
+	rightSplit := container.NewHSplit(splitPanel, libPanel)
+	rightSplit.Offset = 0.45
+	rightPanel := container.NewPadded(rightSplit)
 	centerAndRightSplit := container.NewHSplit(centerSplit, rightPanel)
 	centerAndRightSplit.Offset = initialFontLibRightSplitOffset(fontLibConfig)
 
 	w.SetOnClosed(func() {
 		savedConfig := loadUserConfig()
-		if size := w.Canvas().Size(); size.Width > 0 {
-			savedConfig.FontLibWindowWidth = normalizeFontLibWindowWidth(size.Width)
-		}
 		savedConfig.FontLibRightSplit = normalizeSplitOffset(centerAndRightSplit.Offset)
 		saveUserConfigSilently(savedConfig)
 		if fontLibWindow == w {

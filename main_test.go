@@ -1,17 +1,50 @@
 package main
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"math/rand"
 	"testing"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/driver/desktop"
 	fynetest "fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
+
+func TestOCRCharPickerScrollsToLastItem(t *testing.T) {
+	app := fynetest.NewTempApp(t)
+	window := app.NewWindow("")
+	defer window.Close()
+	options := make([]string, 500)
+	for i := range options {
+		options[i] = fmt.Sprintf("字 %03d", i+1)
+	}
+	searchEntry := widget.NewEntry()
+	picker := newOCRCharPicker(window, func() []string { return options }, searchEntry.SetText)
+	// Position the picker near the bottom of the window, as in the OCR panel.
+	window.SetContent(container.NewBorder(nil, container.NewHBox(searchEntry, picker), nil, nil))
+	window.Resize(fyne.NewSize(320, 280))
+	fynetest.Tap(picker)
+	popup, ok := window.Canvas().Overlays().Top().(*widget.PopUp)
+	if !ok {
+		t.Fatal("opening the character picker did not show a popup")
+	}
+	list := popup.Content.(*widget.List)
+	origin := app.Driver().AbsolutePositionForObject(list)
+	position := origin.Add(fyne.NewPos(16, list.Size().Height-8))
+	fynetest.Scroll(window.Canvas(), position, 0, -20000)
+	if list.GetScrollOffset() <= 0 {
+		t.Fatal("mouse wheel did not scroll the character list")
+	}
+	fynetest.TapCanvas(window.Canvas(), position)
+	if searchEntry.Text != options[len(options)-1] {
+		t.Fatalf("search text after scrolling = %q, want last entry %q", searchEntry.Text, options[len(options)-1])
+	}
+}
 
 func withColorPointsForTest(t *testing.T, points []ColorPoint) {
 	t.Helper()
@@ -1019,52 +1052,31 @@ func TestInitialRightPanelSplitOffsetFallsBackForInvalidValue(t *testing.T) {
 	}
 }
 
-func TestInitialFontLibWindowSizeUsesSavedWidth(t *testing.T) {
-	got := fontLibWindowSizeForScreen(1280, fyne.NewSize(4000, 2500))
-	if got.Width != 1280 {
-		t.Fatalf("font lib window width mismatch: want 1280 got %v", got.Width)
-	}
-	if got.Height != 1000 {
-		t.Fatalf("font lib window height mismatch: want 1000 for 1.28:1 ratio, got %v", got.Height)
+func TestInitialFontLibWindowSizeUsesScreenProportions(t *testing.T) {
+	got := fontLibWindowSizeForScreen(fyne.NewSize(1920, 1080))
+	if got.Width != 1536 || got.Height != 918 {
+		t.Fatalf("default window size = %v, want 1536x918", got)
 	}
 }
 
-func TestInitialFontLibWindowSizeUsesScreenshotAspectRatio(t *testing.T) {
-	got := fontLibWindowSizeForScreen(0, fyne.NewSize(1920, 1080))
-	if ratio := got.Width / got.Height; ratio < 1.279 || ratio > 1.281 {
-		t.Fatalf("font lib window aspect ratio = %.3f, want 1.28", ratio)
-	}
-	if got.Width < 1150 || got.Width > 1153 || got.Height < 899 || got.Height > 901 {
-		t.Fatalf("default window size = %v, want approximately 1152x900 on 1920x1080", got)
-	}
-}
-
-func TestFontLibWindowSizeClampsSavedDimensionsToScreen(t *testing.T) {
-	got := fontLibWindowSizeForScreen(4000, fyne.NewSize(1920, 1080))
-	if got.Width < 1150 || got.Width > 1153 || got.Height < 899 || got.Height > 901 {
-		t.Fatalf("oversized saved config should fall back to 50%% screen window, got %v", got)
+func TestFontLibWindowSizeUsesFallbackForInvalidScreen(t *testing.T) {
+	got := fontLibWindowSizeForScreen(fyne.NewSize(0, 0))
+	if want := fontLibWindowSizeForScreen(fyne.NewSize(1000, 650)); got != want {
+		t.Fatalf("invalid screen should use fallback dimensions, got %v want %v", got, want)
 	}
 }
 
 func TestNormalizeUserConfigFontLibLayout(t *testing.T) {
 	config := normalizeUserConfig(UserConfig{
-		FontLibWindowWidth: 500,
-		FontLibRightSplit:  1.2,
+		FontLibRightSplit: 1.2,
 	})
-	if config.FontLibWindowWidth != 0 {
-		t.Fatalf("invalid font lib window width was not reset: got %v", config.FontLibWindowWidth)
-	}
 	if config.FontLibRightSplit != 0 {
 		t.Fatalf("invalid font lib right split was not reset: got %v", config.FontLibRightSplit)
 	}
 
 	config = normalizeUserConfig(UserConfig{
-		FontLibWindowWidth: 1200,
-		FontLibRightSplit:  0.66,
+		FontLibRightSplit: 0.66,
 	})
-	if config.FontLibWindowWidth != 1200 {
-		t.Fatalf("valid font lib window width was not preserved: got %v", config.FontLibWindowWidth)
-	}
 	if config.FontLibRightSplit != 0.66 {
 		t.Fatalf("valid font lib right split was not preserved: got %v", config.FontLibRightSplit)
 	}
